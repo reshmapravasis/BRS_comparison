@@ -15,13 +15,13 @@
             {{-- ✅ Summary --}}
             <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mt-4 bg-gray-50 dark:bg-gray-800 p-4 rounded-xl shadow-sm space-y-2 sm:space-y-0">
                 <div class="text-sm text-gray-700 dark:text-gray-300">
-                    <strong>Total Entry in Bank Statement:</strong> {{ $this->ledgerCount }} |
-                    <strong>Total Entry within Date Range:</strong> {{ $this->apiCount }}
+                    <strong><span style="color: blue;">Total Entry in Bank Statement:</span></strong> <strong><span style="color: gray;">{{ $this->ledgerCount }} </span></strong> |
+                    <strong><span style="color: blue;">Total Entry within Date Range:</strong> <span style="color: gray;">{{ $this->apiCount }} </span></strong>
                 </div>
                 <div class="text-sm text-gray-700 dark:text-gray-300">
-                    <strong>Total Compared:</strong> {{ $this->matchedCount + $this->unmatchedCount }} |
-                    <span class="text-green-600 dark:text-green-400">Matched: {{ $this->matchedCount }}</span> |
-                    <span class="text-red-600 dark:text-red-400">Unmatched: {{ $this->unmatchedCount }}</span>
+                    <strong><span style="color: blue;">Total Compared:</strong><span style="color: gray;"> {{ $this->matchedCount + $this->unmatchedCount }} </strong></span> |
+                    <span style="color: green;">Matched: {{ $this->matchedCount }}</span> |
+                    <span style="color: red;">Unmatched: {{ $this->unmatchedCount }}</span>
                 </div>
             </div>
 

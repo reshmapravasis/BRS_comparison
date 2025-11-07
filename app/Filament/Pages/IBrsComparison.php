@@ -20,6 +20,7 @@ use Livewire\WithFileUploads;
 use PhpOffice\PhpSpreadsheet\IOFactory;
 use Filament\Forms\Form;
 use Filament\Actions\Action;
+use Filament\Actions\ActionGroup;
 
 
 class IBrsComparison extends Page implements HasForms, HasTable
@@ -355,7 +356,7 @@ class IBrsComparison extends Page implements HasForms, HasTable
                 ->label('Amount')
                 ->getStateUsing(fn($record) => number_format($record['tra_amount'] ?? 0, 2))
                 ->alignRight()
-                ->badge()
+                //->badge()
                 ->color('warning'),
             TextColumn::make('tra_type')
                 ->label('Cr/Dr')
@@ -370,7 +371,7 @@ class IBrsComparison extends Page implements HasForms, HasTable
                 ->label('Amount')
                 ->getStateUsing(fn($record) => number_format($record['amount'] ?? 0, 2))
                 ->alignRight()
-                ->badge()
+                //->badge()
                 ->color('danger'),
             TextColumn::make('type')
                 ->label('Cr/Dr')
@@ -409,17 +410,38 @@ class IBrsComparison extends Page implements HasForms, HasTable
             }),
             
     ];
+    
 
     return $table
         ->records(fn() => collect($data))
         ->columns($columns)
         ->actions($actions)
+        ->headerActions([
+            ActionGroup::make([
+                Action::make('export_matched')
+                    ->label('Export CSV')
+                    ->icon('heroicon-o-document-arrow-down')
+                    ->color('success')
+                    ->button()
+                    ->visible(fn () => $this->viewMode === 'matched')
+                    ->action(fn () => $this->exportCurrentViewToCsv('matched')),
+
+                Action::make('download_manual_backup')
+                    ->label('Download Backup')
+                    ->icon('heroicon-o-cloud-arrow-down')
+                    ->button()
+                    ->color('warning')
+                    ->visible(fn () => $this->viewMode === 'matched')
+                    ->action('downloadManualBackup'),
+            ])
+        ])
         ->paginated([10, 25, 50, 100])
         ->defaultSort(match ($this->viewMode) {
             'matched' => 'tra_date',
             default => 'date',
         }, 'desc')
         ->heading(Str::headline($this->viewMode) . " Entries (" . count($data) . ")");
+
 }
 
 public function verifyRow($uid)

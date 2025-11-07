@@ -84,7 +84,7 @@ class CBrsComparison extends Page implements  HasTable
     'matched' => [],
     'unmatched' => [],
     
-];
+    ];
     public string $viewMode = 'matched';
   
    
@@ -92,11 +92,11 @@ class CBrsComparison extends Page implements  HasTable
     {
         $this->viewMode = $mode;
         // 🎯 CRITICAL FIX: Increment the key to force the Blade to re-render the table element
-    // This tells Livewire to destroy and rebuild the component, forcing header actions to appear.
-    $this->tableRefreshKey++; 
+        // This tells Livewire to destroy and rebuild the component, forcing header actions to appear.
+        $this->tableRefreshKey++; 
     
-    // Force the whole component to refresh as well
-    $this->dispatch('$refresh');
+        // Force the whole component to refresh as well
+        $this->dispatch('$refresh');
     }
     
 
@@ -154,7 +154,7 @@ class CBrsComparison extends Page implements  HasTable
 
    // ✅ Main comparison submission
    // Inside CBrsComparison class
- public function submitComparison(): void
+    public function submitComparison(): void
     {
         try {
             $data = $this->form->getState();
@@ -204,8 +204,8 @@ class CBrsComparison extends Page implements  HasTable
         ]);
 
         $response = Http::attach(
-    'file', file_get_contents($fileObject->getRealPath()), $fileObject->getClientOriginalName()
-)
+            'file', file_get_contents($fileObject->getRealPath()), $fileObject->getClientOriginalName()
+        )
             ->post($apiUrl, [
                 'bill_number' => $data['account_number'],
                 'from_date' => $data['from_date'],
@@ -277,34 +277,37 @@ class CBrsComparison extends Page implements  HasTable
             }
         }
         $getType = function ($amount) {
-            return substr(trim((string) $amount), 0, 1) === '+' ? 'credit' : 'debit';
+            return substr(trim((string) $amount), 0, 1) === '+' ? 'Cr' : 'Dr';
         };
 
        // 🆕 Build Matched Results
-        $this->results['matched'] = $matched->values()->map(function ($row, $index) {
+        $this->results['matched'] = $matched->values()->map(function ($row, $index) use ($getType) {
+            $amount = $row['tra_amount'] ?? 0;
             return [
                 'original_index' => $row['original_index'] ?? $index,
                 'tra_id' => $row['tra_id'],
                 'tra_voucher_number' => $row['tra_voucher_number'],
                 'narration' => $row['tra_narration'] ?? '',
                 'date' => $row['tra_date'] ?? '',
-                'amount' => $row['tra_amount'] ?? '',
-                'type' => ($row['tra_amount'] ?? 0) > 0 ? 'Credit' : 'Debit',
+                'amount' => $amount,
+                'type' => $getType($amount),
+                'color' => $getType === 'Cr' ? 'text-green-600' : 'text-red-600',
                 'manual_verified' => false, // ✅ system matched
                 'from_unmatched' => false,  // ✅ flag to detect later
             ];
         })->toArray(); // 🆕 Convert to array
 
         // 🆕 Build Unmatched Results & Populate Unmatched Map
-        $unmatchedItems = $unmatched->values()->map(function ($row, $index) {
+        $unmatchedItems = $unmatched->values()->map(function ($row, $index) use ($getType) {
+            $amount = $row['amount'] ?? 0;
             return [
                 'original_index' => $row['original_index'] ?? $index,
                 'tra_id' => '-',
                 'tra_voucher_number' => '-',
                 'narration' => $row['narration'] ?? '',
                 'date' => $row['date'] ?? '',
-                'amount' => $row['amount'] ?? '',
-                'type' => ($row['amount'] ?? 0) > 0 ? 'Credit' : 'Debit',
+                'amount' => $amount,
+                'type' => $getType($amount),
                 'manual_verified' => false,
                 'from_unmatched' => false,
             ];
@@ -338,418 +341,381 @@ class CBrsComparison extends Page implements  HasTable
             ->body("Matched: {$this->matchedCount} | Unmatched: {$this->unmatchedCount}")
             ->success()
             ->send();
-    } catch (\Throwable $e) {
-        Log::error('Comparison Failed', ['error' => $e->getMessage()]);
-        $this->results = ['matched' => [], 'unmatched' => []];
+        } catch (\Throwable $e) {
+            Log::error('Comparison Failed', ['error' => $e->getMessage()]);
+            $this->results = ['matched' => [], 'unmatched' => []];
+            Notification::make()
+                ->title('❌ Comparison Failed')
+                ->body('Error: ' . $e->getMessage())
+                ->danger()
+                ->send();
+        }
+    }
+     
+    public function verifyTransaction(int $originalIndex): void
+    {
+        if (!isset($this->unmatchedMap[$originalIndex])) return;
+
+        $item = $this->unmatchedMap[$originalIndex];
+        
+        // ✅ MUST be this reactive method to force Livewire to see the change
+        $this->unmatchedMap = collect($this->unmatchedMap)
+                                ->forget($originalIndex)
+                                ->toArray(); 
+        
+        // Move to matched
+        $item['from_unmatched'] = true;
+        $item['manual_verified'] = true;
+        array_push($this->results['matched'], $item);
+
+        $this->refreshTables(); // Triggers $this->dispatch('$refresh')
+
         Notification::make()
-            ->title('❌ Comparison Failed')
-            ->body('Error: ' . $e->getMessage())
-            ->danger()
+            ->title('✅ Verified')
+            ->body('Transaction moved to matched list.')
+            ->success()
             ->send();
     }
-}
-    // Inside CBrsComparison class
-// ... (Your existing toggleView method) ...
+    public function revertTransaction(int $originalIndex): void
+    {
+        // Find and remove from matched
+        $keyToRemove = null;
+        $itemToRevert = null;
 
-    // ✅ When “Verify” is clicked (Unmatched -> Matched)
- 
-
-// Inside CBrsComparison class
-
-public function verifyTransaction(int $originalIndex): void
-{
-    if (!isset($this->unmatchedMap[$originalIndex])) return;
-
-    $item = $this->unmatchedMap[$originalIndex];
-    
-    // ✅ MUST be this reactive method to force Livewire to see the change
-    $this->unmatchedMap = collect($this->unmatchedMap)
-                            ->forget($originalIndex)
-                            ->toArray(); 
-    
-    // Move to matched
-    $item['from_unmatched'] = true;
-    $item['manual_verified'] = true;
-    array_push($this->results['matched'], $item);
-
-    $this->refreshTables(); // Triggers $this->dispatch('$refresh')
-
-    Notification::make()
-        ->title('✅ Verified')
-        ->body('Transaction moved to matched list.')
-        ->success()
-        ->send();
-}
-public function revertTransaction(int $originalIndex): void
-{
-    // Find and remove from matched
-    $keyToRemove = null;
-    $itemToRevert = null;
-
-    foreach ($this->results['matched'] as $key => $item) {
-        if (($item['original_index'] ?? null) == $originalIndex) {
-            $keyToRemove = $key;
-            $itemToRevert = $item;
-            break;
+        foreach ($this->results['matched'] as $key => $item) {
+            if (($item['original_index'] ?? null) == $originalIndex) {
+                $keyToRemove = $key;
+                $itemToRevert = $item;
+                break;
+            }
         }
+
+        if (is_null($keyToRemove)) return;
+
+        unset($this->results['matched'][$keyToRemove]);
+
+        // Mark as unverified
+        $itemToRevert['from_unmatched'] = false;
+        $itemToRevert['manual_verified'] = false;
+
+        // Restore in the exact same position by index key
+        $this->unmatchedMap[$originalIndex] = $itemToRevert;
+        ksort($this->unmatchedMap);
+
+        // Force full array re-assignment
+        $this->results['unmatched'] = array_values($this->unmatchedMap);
+        $this->results['matched'] = array_values($this->results['matched']);
+
+        $this->matchedCount = count($this->results['matched']);
+        $this->unmatchedCount = count($this->results['unmatched']);
+
+        $this->dispatch('$refresh');
+
+        Notification::make()
+            ->title('↩️ Reverted')
+            ->body('Transaction restored to its original place.')
+            ->success()
+            ->send();
     }
 
-    if (is_null($keyToRemove)) return;
+    public function downloadManualBackup(): ?StreamedResponse
+    {
+    try {
+            $manualMatches = collect($this->results['matched'] ?? [])
+                ->filter(fn($row) => ($row['manual_verified'] ?? false) === true)
+                ->values();
 
-    unset($this->results['matched'][$keyToRemove]);
+            if ($manualMatches->isEmpty()) {
+                Notification::make()
+                    ->title('⚠️ No Manual Matches Found')
+                    ->body('There are no manually verified transactions to back up.')
+                    ->warning()
+                    ->send();
 
-    // Mark as unverified
-    $itemToRevert['from_unmatched'] = false;
-    $itemToRevert['manual_verified'] = false;
+                return null; // ✅ allowed because of "?StreamedResponse"
+            }
 
-    // Restore in the exact same position by index key
-    $this->unmatchedMap[$originalIndex] = $itemToRevert;
-    ksort($this->unmatchedMap);
+            $fileName = 'manual_matched_backup_' . date('Ymd_His') . '.csv';
+            $headers = [
+                'Content-Type' => 'text/csv',
+                'Content-Disposition' => 'attachment; filename="' . $fileName . '";',
+            ];
 
-    // Force full array re-assignment
-    $this->results['unmatched'] = array_values($this->unmatchedMap);
-    $this->results['matched'] = array_values($this->results['matched']);
+            $callback = function () use ($manualMatches) {
+                $file = fopen('php://output', 'w');
+                fputcsv($file, [
+                    'original_index', 'tra_id', 'tra_voucher_number', 'narration',
+                    'date', 'amount', 'type', 'manual_verified', 'from_unmatched',
+                ]);
 
-    $this->matchedCount = count($this->results['matched']);
-    $this->unmatchedCount = count($this->results['unmatched']);
+                foreach ($manualMatches as $row) {
+                    fputcsv($file, [
+                        $row['original_index'] ?? '-',
+                        $row['tra_id'] ?? '-',
+                        $row['tra_voucher_number'] ?? '-',
+                        $row['narration'] ?? '',
+                        $row['date'] ?? '',
+                        $row['amount'] ?? '',
+                        $row['type'] ?? '',
+                        (int)($row['manual_verified'] ?? 1),
+                        (int)($row['from_unmatched'] ?? 1),
+                    ]);
+                }
 
-    $this->dispatch('$refresh');
+                fclose($file);
+            };
 
-    Notification::make()
-        ->title('↩️ Reverted')
-        ->body('Transaction restored to its original place.')
-        ->success()
-        ->send();
-}
+            return response()->stream($callback, 200, $headers);
 
-public function downloadManualBackup(): ?StreamedResponse
-{
-   try {
-        $manualMatches = collect($this->results['matched'] ?? [])
-            ->filter(fn($row) => ($row['manual_verified'] ?? false) === true)
-            ->values();
-
-        if ($manualMatches->isEmpty()) {
+        } catch (\Throwable $e) {
             Notification::make()
-                ->title('⚠️ No Manual Matches Found')
-                ->body('There are no manually verified transactions to back up.')
-                ->warning()
+                ->title('❌ Download Failed')
+                ->body('Something went wrong while generating the backup file.')
+                ->danger()
                 ->send();
 
-            return null; // ✅ allowed because of "?StreamedResponse"
+            return null; // ✅ also allowed
+        }
+    }
+/**
+ * Uploads a backup CSV and appends the transactions to the matched list.
+ */
+    public function uploadBackup(): void
+    {
+        $fileObject = $this->backup_file;
+        if (!$fileObject) {
+            Notification::make()
+                ->title('⚠️ Upload Failed')
+                ->body('No backup file selected.')
+                ->danger()
+                ->send();
+            return;
         }
 
-        $fileName = 'manual_matched_backup_' . date('Ymd_His') . '.csv';
+        $filePath = method_exists($fileObject, 'getRealPath')
+            ? $fileObject->getRealPath()
+            : $fileObject->getPathname();
+
+        if (!file_exists($filePath) || !is_readable($filePath)) {
+            Notification::make()
+                ->title('⚠️ Could not read uploaded backup file.')
+                ->danger()
+                ->send();
+            return;
+        }
+
+        $handle = fopen($filePath, 'r');
+        if (!$handle) {
+            Notification::make()
+                ->title('⚠️ Failed to open file.')
+                ->danger()
+                ->send();
+            return;
+        }
+
+        $headers = fgetcsv($handle);
+        if (!$headers) {
+            fclose($handle);
+            Notification::make()
+                ->title('⚠️ Invalid CSV headers.')
+                ->danger()
+                ->send();
+            return;
+        }
+
+        $rows = [];
+        $recordCount = 0;
+        $baseId = random_int(100000000, 999999999);
+
+        while (($row = fgetcsv($handle)) !== false) {
+            if (count($row) !== count($headers)) continue;
+
+            $combined = array_combine($headers, $row);
+            $amountRaw = str_replace(',', '', $combined['amount'] ?? $combined['Amount'] ?? '0');
+
+            $rows[] = [
+                'original_index'     => ($baseId * 10) + $recordCount,
+                'tra_id'             => $combined['tra_id'] ?? $combined['Id'] ?? '-',
+                'tra_voucher_number' => $combined['tra_voucher_number'] ?? $combined['Voucher No'] ?? '-',
+                'narration'          => $combined['narration'] ?? $combined['Narration'] ?? '',
+                'date'               => $combined['date'] ?? $combined['Date'] ?? '',
+                'amount'             => (float)$amountRaw,
+                'type'               => ($combined['type'] ?? $combined['Cr/Dr'] ?? 'Dr.') === 'Cr.' ? 'Credit' : 'Debit',
+                'manual_verified'    => true,
+                'from_unmatched'     => true,
+            ];
+            $recordCount++;
+        }
+        fclose($handle);
+
+        if (empty($rows)) {
+            Notification::make()
+                ->title('⚠️ No valid rows found in backup file.')
+                ->danger()
+                ->send();
+            return;
+        }
+
+        // ✅ Keep appended rows in a dedicated property
+        $this->manualMatched = array_merge($this->manualMatched, $rows);
+
+        // ✅ Merge once with results safely
+        $this->results['matched'] = array_merge($this->results['matched'] ?? [], $this->manualMatched);
+
+        $this->matchedCount = count($this->results['matched']);
+        $this->unmatchedCount = count($this->results['unmatched'] ?? []);
+        $this->refreshTables();
+
+        Notification::make()
+            ->title('✅ Backup Uploaded')
+            ->body("{$recordCount} manual records appended.")
+            ->success()
+            ->send();
+
+        $this->backup_file = null;
+    }
+
+    public function exportCurrentViewToCsv(string $mode): \Symfony\Component\HttpFoundation\StreamedResponse
+    {
+        // Determine the data source based on the mode parameter
+        $dataToExport = $this->results[$mode] ?? [];
+        $isMatched = $mode === 'matched';
+        
+        $modeLabel = $isMatched ? 'Matched' : 'Unmatched';
+        $fileName = strtolower($modeLabel) . '_transactions_' . date('Ymd_His') . '.csv';
+
+        if (empty($dataToExport)) {
+            Notification::make()
+                ->title("⚠️ No {$modeLabel} Data")
+                ->body("There are no transactions in the {$modeLabel} list to export.")
+                ->warning()
+                ->send();
+            return response()->stream(fn() => '', 200, ['Content-Type' => 'text/plain']);
+        }
+
         $headers = [
             'Content-Type' => 'text/csv',
             'Content-Disposition' => 'attachment; filename="' . $fileName . '";',
         ];
 
-        $callback = function () use ($manualMatches) {
+        $callback = function () use ($dataToExport, $isMatched) {
             $file = fopen('php://output', 'w');
-            fputcsv($file, [
-                'original_index', 'tra_id', 'tra_voucher_number', 'narration',
-                'date', 'amount', 'type', 'manual_verified', 'from_unmatched',
-            ]);
 
-            foreach ($manualMatches as $row) {
-                fputcsv($file, [
+            // Base CSV Headers
+            $csvHeaders = [
+                'Sl No',
+                'Original Index',
+                'Date',
+                'Narration',
+                'Amount',
+                'Cr/Dr',
+                'Transaction ID',
+                'Voucher Number',
+            ];
+
+            // Add extra headers only for the matched list
+            if ($isMatched) {
+                $csvHeaders[] = 'Manually Verified';
+                $csvHeaders[] = 'From Unmatched List';
+            }
+            
+            fputcsv($file, $csvHeaders);
+
+            // Write data rows
+            $slNo = 1;
+            foreach ($dataToExport as $row) {
+                $rowData = [
+                    $slNo++,
                     $row['original_index'] ?? '-',
-                    $row['tra_id'] ?? '-',
-                    $row['tra_voucher_number'] ?? '-',
-                    $row['narration'] ?? '',
                     $row['date'] ?? '',
+                    $row['narration'] ?? '',
                     $row['amount'] ?? '',
                     $row['type'] ?? '',
-                    (int)($row['manual_verified'] ?? 1),
-                    (int)($row['from_unmatched'] ?? 1),
-                ]);
+                    $row['tra_id'] ?? '-',
+                    $row['tra_voucher_number'] ?? '-',
+                ];
+
+                // Add extra columns only for the matched list
+                if ($isMatched) {
+                    $rowData[] = ($row['manual_verified'] ?? false) ? 'Yes' : 'No';
+                    $rowData[] = ($row['from_unmatched'] ?? false) ? 'Yes' : 'No';
+                }
+                
+                fputcsv($file, $rowData);
             }
 
             fclose($file);
         };
 
         return response()->stream($callback, 200, $headers);
-
-    } catch (\Throwable $e) {
-        Notification::make()
-            ->title('❌ Download Failed')
-            ->body('Something went wrong while generating the backup file.')
-            ->danger()
-            ->send();
-
-        return null; // ✅ also allowed
-    }
-}
-/**
- * Uploads a backup CSV and appends the transactions to the matched list.
- */
-public function uploadBackup(): void
-{
-    $fileObject = $this->backup_file;
-    if (!$fileObject) {
-        Notification::make()
-            ->title('⚠️ Upload Failed')
-            ->body('No backup file selected.')
-            ->danger()
-            ->send();
-        return;
     }
 
-    $filePath = method_exists($fileObject, 'getRealPath')
-        ? $fileObject->getRealPath()
-        : $fileObject->getPathname();
+    private function refreshTables(): void
+    {
+        // 1. Recalculate the arrays for table display
+        $this->results['matched'] = array_values($this->results['matched']);
+        $this->results['unmatched'] = collect($this->unmatchedMap)
+                                        ->sortKeys() 
+                                        ->values()
+                                        ->toArray();
 
-    if (!file_exists($filePath) || !is_readable($filePath)) {
-        Notification::make()
-            ->title('⚠️ Could not read uploaded backup file.')
-            ->danger()
-            ->send();
-        return;
-    }
+        // 2. Update counts
+        $this->matchedCount   = count($this->results['matched']);
+        $this->unmatchedCount = count($this->results['unmatched']);
 
-    $handle = fopen($filePath, 'r');
-    if (!$handle) {
-        Notification::make()
-            ->title('⚠️ Failed to open file.')
-            ->danger()
-            ->send();
-        return;
-    }
-
-    $headers = fgetcsv($handle);
-    if (!$headers) {
-        fclose($handle);
-        Notification::make()
-            ->title('⚠️ Invalid CSV headers.')
-            ->danger()
-            ->send();
-        return;
-    }
-
-    $rows = [];
-    $recordCount = 0;
-    $baseId = random_int(100000000, 999999999);
-
-    while (($row = fgetcsv($handle)) !== false) {
-        if (count($row) !== count($headers)) continue;
-
-        $combined = array_combine($headers, $row);
-        $amountRaw = str_replace(',', '', $combined['amount'] ?? $combined['Amount'] ?? '0');
-
-        $rows[] = [
-            'original_index'     => ($baseId * 10) + $recordCount,
-            'tra_id'             => $combined['tra_id'] ?? $combined['Id'] ?? '-',
-            'tra_voucher_number' => $combined['tra_voucher_number'] ?? $combined['Voucher No'] ?? '-',
-            'narration'          => $combined['narration'] ?? $combined['Narration'] ?? '',
-            'date'               => $combined['date'] ?? $combined['Date'] ?? '',
-            'amount'             => (float)$amountRaw,
-            'type'               => ($combined['type'] ?? $combined['Cr/Dr'] ?? 'Dr.') === 'Cr.' ? 'Credit' : 'Debit',
-            'manual_verified'    => true,
-            'from_unmatched'     => true,
-        ];
-        $recordCount++;
-    }
-    fclose($handle);
-
-    if (empty($rows)) {
-        Notification::make()
-            ->title('⚠️ No valid rows found in backup file.')
-            ->danger()
-            ->send();
-        return;
-    }
-
-    // ✅ Keep appended rows in a dedicated property
-    $this->manualMatched = array_merge($this->manualMatched, $rows);
-
-    // ✅ Merge once with results safely
-    $this->results['matched'] = array_merge($this->results['matched'] ?? [], $this->manualMatched);
-
-    $this->matchedCount = count($this->results['matched']);
-    $this->unmatchedCount = count($this->results['unmatched'] ?? []);
-    $this->refreshTables();
-
-    Notification::make()
-        ->title('✅ Backup Uploaded')
-        ->body("{$recordCount} manual records appended.")
-        ->success()
-        ->send();
-
-    $this->backup_file = null;
-}
-
-
-
-
-
-
-
-
-public function exportCurrentViewToCsv(string $mode): \Symfony\Component\HttpFoundation\StreamedResponse
-{
-    // Determine the data source based on the mode parameter
-    $dataToExport = $this->results[$mode] ?? [];
-    $isMatched = $mode === 'matched';
-    
-    $modeLabel = $isMatched ? 'Matched' : 'Unmatched';
-    $fileName = strtolower($modeLabel) . '_transactions_' . date('Ymd_His') . '.csv';
-
-    if (empty($dataToExport)) {
-        Notification::make()
-            ->title("⚠️ No {$modeLabel} Data")
-            ->body("There are no transactions in the {$modeLabel} list to export.")
-            ->warning()
-            ->send();
-        return response()->stream(fn() => '', 200, ['Content-Type' => 'text/plain']);
-    }
-
-    $headers = [
-        'Content-Type' => 'text/csv',
-        'Content-Disposition' => 'attachment; filename="' . $fileName . '";',
-    ];
-
-    $callback = function () use ($dataToExport, $isMatched) {
-        $file = fopen('php://output', 'w');
-
-        // Base CSV Headers
-        $csvHeaders = [
-            'Sl No',
-            'Original Index',
-            'Date',
-            'Narration',
-            'Amount',
-            'Cr/Dr',
-            'Transaction ID',
-            'Voucher Number',
-        ];
-
-        // Add extra headers only for the matched list
-        if ($isMatched) {
-            $csvHeaders[] = 'Manually Verified';
-            $csvHeaders[] = 'From Unmatched List';
+        // 3. Force Re-render
+        
+        // 🎯 CRITICAL FIX: Attempt to directly call the Livewire refresh method on the component instance.
+        // This is the most reliable way to force the DOM to update when dispatch() fails.
+        if (method_exists($this, 'getLivewire')) {
+            $this->getLivewire()->dispatch('$refresh');
+        } else {
+            // Fallback for Page components
+            $this->dispatch('$refresh'); 
         }
         
-        fputcsv($file, $csvHeaders);
-
-        // Write data rows
-        $slNo = 1;
-        foreach ($dataToExport as $row) {
-            $rowData = [
-                $slNo++,
-                $row['original_index'] ?? '-',
-                $row['date'] ?? '',
-                $row['narration'] ?? '',
-                $row['amount'] ?? '',
-                $row['type'] ?? '',
-                $row['tra_id'] ?? '-',
-                $row['tra_voucher_number'] ?? '-',
-            ];
-
-            // Add extra columns only for the matched list
-            if ($isMatched) {
-                $rowData[] = ($row['manual_verified'] ?? false) ? 'Yes' : 'No';
-                $rowData[] = ($row['from_unmatched'] ?? false) ? 'Yes' : 'No';
-            }
-            
-            fputcsv($file, $rowData);
-        }
-
-        fclose($file);
-    };
-
-    return response()->stream($callback, 200, $headers);
-}
-
-
-   
-
-private function refreshTables(): void
-{
-    // 1. Recalculate the arrays for table display
-    $this->results['matched'] = array_values($this->results['matched']);
-    $this->results['unmatched'] = collect($this->unmatchedMap)
-                                    ->sortKeys() 
-                                    ->values()
-                                    ->toArray();
-
-    // 2. Update counts
-    $this->matchedCount   = count($this->results['matched']);
-    $this->unmatchedCount = count($this->results['unmatched']);
-
-    // 3. Force Re-render
-    
-    // 🎯 CRITICAL FIX: Attempt to directly call the Livewire refresh method on the component instance.
-    // This is the most reliable way to force the DOM to update when dispatch() fails.
-    if (method_exists($this, 'getLivewire')) {
-        $this->getLivewire()->dispatch('$refresh');
-    } else {
-        // Fallback for Page components
-        $this->dispatch('$refresh'); 
     }
-    
-    // Note: The $this->getLivewire() method might not exist directly on the page, 
-    // but the final dispatch is the key.
-
-    // 💡 If the above still fails, try this aggressive approach (requires the parent component to be available):
-    // $this->dispatch('refreshComponent', component: 'table'); 
-}
-
-
-
-    
-
-// REMOVE: The old, incorrect updateCounts method
-// private function updateCounts()
-// {
-//     $this->counts['count_matched'] = count($this->matchedData);
-//     $this->counts['count_unmatched'] = count($this->unmatchedData);
-// }
     // ✅ Table Display
     public function table(Table $table): Table
-{
-    return $table
-        ->columns([
-            TextColumn::make('sl_no')
-                ->label('Sl No')
-                ->sortable(),
+    {
+        return $table
+            ->columns([
+                TextColumn::make('sl_no')
+                    ->label('Sl No')
+                    ->sortable(),
 
-            TextColumn::make('tra_id')
-                ->label('ID')
-                ->sortable(),
+                TextColumn::make('tra_id')
+                    ->label('ID')
+                    ->sortable(),
 
-            TextColumn::make('tra_voucher_number')
-                ->label('Voucher No')
-                ->sortable(),
+                TextColumn::make('tra_voucher_number')
+                    ->label('Voucher No')
+                    ->sortable(),
 
-            TextColumn::make('narration')
-                ->label('Narration')
-                ->limit(60)
-                ->wrap(),
+                TextColumn::make('narration')
+                    ->label('Narration')
+                    ->limit(60)
+                    ->wrap(),
 
-            TextColumn::make('date')
-                ->label('Date')
-                ->sortable(),
+                TextColumn::make('date')
+                    ->label('Date')
+                    ->sortable(),
 
-            TextColumn::make('amount')
-                ->label('Amount')
-                ->money('INR', true)
-                ->sortable(),
+                TextColumn::make('amount')
+                    ->label('Amount')
+                    ->money('INR', true)
+                    ->sortable(),
 
-            TextColumn::make('type')
-                ->label('Cr/Dr')
-                ->colors([
-                    // Correct:
-                    'credit' => 'success', // ✅ If the value is 'credit', use the 'success' color.
-                    'debit' => 'danger']),
+                TextColumn::make('type')
+                    ->label('Cr/Dr')
+                    ->color(fn($record) => ($record['tra_amount'] ?? 0) > 0 ? 'success' : 'danger'),
+                // TextColumn::make('original_index')
+                //         ->label('Original Index')
+                //         ->sortable()
+                //         ->hidden(true),
                     
-            // TextColumn::make('original_index')
-            //         ->label('Original Index')
-            //         ->sortable()
-            //         ->hidden(true),
-                
-                
-        ])
+                    
+            ])
 
             // ✅ This provides data from arrays instead of Eloquent
         ->records(function () {
@@ -778,12 +744,16 @@ private function refreshTables(): void
                 Action::make('export_matched')
                     ->label('Export CSV')
                     ->icon('heroicon-o-document-arrow-down')
+                    ->color('success')
+                    ->button()
                     ->visible(fn () => $this->viewMode === 'matched') // Only visible in unmatched view
                     ->action(fn () => $this->exportCurrentViewToCsv('matched')),
                 // 2. Normal Export (Unmatched List)
                  Action::make('export_unmatched')
                     ->label('Export CSV')
                     ->icon('heroicon-o-document-arrow-down')
+                    ->color('primary')
+                    ->button()
                     ->visible(fn () => $this->viewMode === 'unmatched') // Only visible in unmatched view
                     ->action(fn () => $this->exportCurrentViewToCsv('unmatched')),
                     //->color('info'),
@@ -792,6 +762,8 @@ private function refreshTables(): void
                 Action::make('download_manual_backup')
                     ->label('Download Backup')
                     ->icon('heroicon-o-cloud-arrow-down')
+                    ->color('warning')
+                    ->button()
                     ->visible(fn () => $this->viewMode === 'matched') // Only visible in matched view
                     ->action('downloadManualBackup'),
 
@@ -799,6 +771,8 @@ private function refreshTables(): void
                 Action::make('upload_backup')
                     ->label('Upload Backup')
                     ->icon('heroicon-o-cloud-arrow-up')
+                    ->color('info')
+                    ->button()
                     ->visible(fn () => $this->viewMode === 'matched') // Only visible in matched view
                     ->form([
                         FileUpload::make('backup_file')
@@ -811,44 +785,44 @@ private function refreshTables(): void
                     ])
                     ->modalSubmitActionLabel('Upload')
                     ->action(function (array $data) {
-        // ✅ Read file content manually, not reactively
-        $fileObject = $data['backup_file'] ?? null;
+                        // ✅ Read file content manually, not reactively
+                        $fileObject = $data['backup_file'] ?? null;
 
-        if (!$fileObject || !method_exists($fileObject, 'getRealPath')) {
-            Notification::make()
-                ->title('❌ Upload Failed')
-                ->body('Please select a valid backup file to upload.')
-                ->danger()
-                ->send();
-            return;
-        }
+                        if (!$fileObject || !method_exists($fileObject, 'getRealPath')) {
+                            Notification::make()
+                                ->title('❌ Upload Failed')
+                                ->body('Please select a valid backup file to upload.')
+                                ->danger()
+                                ->send();
+                            return;
+                        }
 
-        $filePath = $fileObject->getRealPath();
-        if (!$filePath || !file_exists($filePath)) {
-            Notification::make()
-                ->title('⚠️ File missing or unreadable.')
-                ->danger()
-                ->send();
-            return;
-        }
+                        $filePath = $fileObject->getRealPath();
+                        if (!$filePath || !file_exists($filePath)) {
+                            Notification::make()
+                                ->title('⚠️ File missing or unreadable.')
+                                ->danger()
+                                ->send();
+                            return;
+                        }
 
-        // ✅ Read full file content at once
-        $csvData = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+                        // ✅ Read full file content at once
+                        $csvData = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
 
-        if (count($csvData) <= 1) {
-            Notification::make()
-                ->title('⚠️ Backup file is empty.')
-                ->danger()
-                ->send();
-            return;
-        }
+                        if (count($csvData) <= 1) {
+                            Notification::make()
+                                ->title('⚠️ Backup file is empty.')
+                                ->danger()
+                                ->send();
+                            return;
+                        }
 
-        // Pass parsed content directly to uploadBackup() using public property
-        $this->backup_file = $fileObject;
+                        // Pass parsed content directly to uploadBackup() using public property
+                        $this->backup_file = $fileObject;
 
-        // ✅ Call uploadBackup() AFTER file is fully read
-        $this->uploadBackup();
-    }),
+                        // ✅ Call uploadBackup() AFTER file is fully read
+                        $this->uploadBackup();
+                    }),
 
             ])
             ->label('Actions')
@@ -891,33 +865,33 @@ private function refreshTables(): void
                         }
                     }),
                 ]);
-}
-
-    private function readFile(string $filePath, string $ext): \Illuminate\Support\Collection
-{
-    $data = collect();
-
-    if ($ext === 'qif') {
-        $file = fopen($filePath, 'r');
-        $amt = $date = $memo = null;
-        while (($line = fgets($file)) !== false) {
-            $line = trim($line);
-            if ($line === '') continue;
-
-            if ($line[0] === 'T') $amt = substr($line, 1);
-            if ($line[0] === 'D') $date = substr($line, 1);
-            if ($line[0] === 'M') {
-                $memo = substr($line, 1);
-                $data->push(['narration' => $memo, 'amount' => $amt, 'date' => $date]);
-            }
-        }
-        fclose($file);
     }
 
-    // TODO: handle XLS/XLSX if needed
+    private function readFile(string $filePath, string $ext): \Illuminate\Support\Collection
+    {
+        $data = collect();
 
-    return $data;
-}
+        if ($ext === 'qif') {
+            $file = fopen($filePath, 'r');
+            $amt = $date = $memo = null;
+            while (($line = fgets($file)) !== false) {
+                $line = trim($line);
+                if ($line === '') continue;
+
+                if ($line[0] === 'T') $amt = substr($line, 1);
+                if ($line[0] === 'D') $date = substr($line, 1);
+                if ($line[0] === 'M') {
+                    $memo = substr($line, 1);
+                    $data->push(['narration' => $memo, 'amount' => $amt, 'date' => $date]);
+                }
+            }
+            fclose($file);
+        }
+
+        // TODO: handle XLS/XLSX if needed
+
+        return $data;
+    }
 
 
    
