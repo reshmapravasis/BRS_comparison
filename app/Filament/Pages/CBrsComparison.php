@@ -29,7 +29,7 @@ use Livewire\Features\SupportFileUploads\TemporaryUploadedFile; // add this impo
 use PhpOffice\PhpSpreadsheet\IOFactory;
 use PhpOffice\PhpSpreadsheet\Shared\Date as ExcelDate;
 use Illuminate\Support\Collection;
-
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 
 
@@ -66,7 +66,7 @@ class CBrsComparison extends Page implements  HasTable
     public  $uploaded_file = [];
     public int $tableRefreshKey = 0;
     public array $pendingBackupRows = [];
-
+    public array $manualMatched = [];
     public $account_number = null;
     public $url = null;
     public $from_date = null;
@@ -99,19 +99,7 @@ class CBrsComparison extends Page implements  HasTable
     $this->dispatch('$refresh');
     }
     
-    public function getTabs(): array
-{
-    return [
-        'matched' => \Filament\Tables\Tab::make()
-            ->badge($this->matchedCount)
-            ->modifyQueryUsing(fn ($query) => $query->where('view_mode', 'matched')),
 
-        'unmatched' => \Filament\Tables\Tab::make()
-            ->badge($this->unmatchedCount)
-            ->modifyQueryUsing(fn ($query) => $query->where('view_mode', 'unmatched')),
-    ];
-}
-   
     public function mount(): void
     {
         // Initialize the form state
@@ -434,254 +422,167 @@ public function revertTransaction(int $originalIndex): void
         ->send();
 }
 
-public function downloadManualBackup(): \Symfony\Component\HttpFoundation\StreamedResponse
+public function downloadManualBackup(): ?StreamedResponse
 {
-    // Filter the matched results for manually verified rows
-    $manualMatches = collect($this->results['matched'] ?? [])
-        ->filter(fn($row) => ($row['manual_verified'] ?? false) === true)
-        ->values(); // Use values() to reset keys
+   try {
+        $manualMatches = collect($this->results['matched'] ?? [])
+            ->filter(fn($row) => ($row['manual_verified'] ?? false) === true)
+            ->values();
 
-    // 🎯 REFINED CHECK: If the collection is empty, display the error and stop.
-    if ($manualMatches->isEmpty()) {
-        Notification::make()
-            ->title('⚠️ No Manual Matches Found')
-            ->body('Download failed: No transactions were manually verified')
-            ->warning()
-            ->send();
-        return null;
-    }
+        if ($manualMatches->isEmpty()) {
+            Notification::make()
+                ->title('⚠️ No Manual Matches Found')
+                ->body('There are no manually verified transactions to back up.')
+                ->warning()
+                ->send();
 
-    $fileName = 'manual_matched_backup_' . date('Ymd_His') . '.csv';
-    $headers = [
-        'Content-Type' => 'text/csv',
-        'Content-Disposition' => 'attachment; filename="' . $fileName . '";',
-    ];
-
-    $callback = function () use ($manualMatches) {
-        $file = fopen('php://output', 'w');
-        
-        // ... (rest of the CSV creation logic remains the same) ...
-
-        // Define CSV Headers (Crucial for re-upload)
-        fputcsv($file, [
-            'original_index',
-            'tra_id',
-            'tra_voucher_number',
-            'narration',
-            'date',
-            'amount',
-            'type',
-            'manual_verified', // Ensures it restores with 'Yes'
-            'from_unmatched',  // Ensures it restores with 'Yes'
-        ]);
-
-        // Write data rows
-        foreach ($manualMatches as $row) {
-            fputcsv($file, [
-                $row['original_index'] ?? '-',
-                $row['tra_id'] ?? '-',
-                $row['tra_voucher_number'] ?? '-',
-                $row['narration'] ?? '',
-                $row['date'] ?? '',
-                $row['amount'] ?? '',
-                $row['type'] ?? '',
-                // Ensure boolean flags are exported as 1 or 0
-                (int)($row['manual_verified'] ?? 1),
-                (int)($row['from_unmatched'] ?? 1),
-            ]);
+            return null; // ✅ allowed because of "?StreamedResponse"
         }
 
-        fclose($file);
-    };
+        $fileName = 'manual_matched_backup_' . date('Ymd_His') . '.csv';
+        $headers = [
+            'Content-Type' => 'text/csv',
+            'Content-Disposition' => 'attachment; filename="' . $fileName . '";',
+        ];
 
-    return response()->stream($callback, 200, $headers);
+        $callback = function () use ($manualMatches) {
+            $file = fopen('php://output', 'w');
+            fputcsv($file, [
+                'original_index', 'tra_id', 'tra_voucher_number', 'narration',
+                'date', 'amount', 'type', 'manual_verified', 'from_unmatched',
+            ]);
+
+            foreach ($manualMatches as $row) {
+                fputcsv($file, [
+                    $row['original_index'] ?? '-',
+                    $row['tra_id'] ?? '-',
+                    $row['tra_voucher_number'] ?? '-',
+                    $row['narration'] ?? '',
+                    $row['date'] ?? '',
+                    $row['amount'] ?? '',
+                    $row['type'] ?? '',
+                    (int)($row['manual_verified'] ?? 1),
+                    (int)($row['from_unmatched'] ?? 1),
+                ]);
+            }
+
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
+
+    } catch (\Throwable $e) {
+        Notification::make()
+            ->title('❌ Download Failed')
+            ->body('Something went wrong while generating the backup file.')
+            ->danger()
+            ->send();
+
+        return null; // ✅ also allowed
+    }
 }
-
 /**
  * Uploads a backup CSV and appends the transactions to the matched list.
  */
 public function uploadBackup(): void
 {
-    $fileObject = $this->backup_file; 
-
+    $fileObject = $this->backup_file;
     if (!$fileObject) {
         Notification::make()
-            ->title('❌ Upload Failed')
-            ->body('No backup file found.')
-            ->danger()
-            ->send();
-        return; 
-    }
-
-    $filePath = $fileObject->getRealPath();
-
-    if (($handle = fopen($filePath, "r")) === FALSE) {
-        Notification::make()
-            ->title('❌ Upload Failed')
-            ->body('Unable to open the uploaded file.')
+            ->title('⚠️ Upload Failed')
+            ->body('No backup file selected.')
             ->danger()
             ->send();
         return;
     }
 
-    $headers = fgetcsv($handle);
-    if (!$headers || count($headers) < 2) {
+    $filePath = method_exists($fileObject, 'getRealPath')
+        ? $fileObject->getRealPath()
+        : $fileObject->getPathname();
+
+    if (!file_exists($filePath) || !is_readable($filePath)) {
         Notification::make()
-            ->title('⚠️ Invalid File')
-            ->body('Header row missing or file structure invalid.')
-            ->warning()
-            ->send();
-        fclose($handle);
-        return;
-    }
-
-    $dataToAppend = [];
-    $recordCount = 0;
-    $baseId = random_int(100000000, 999999999);
-
-    // ✅ Read all rows into $dataToAppend
-    while (($row = fgetcsv($handle)) !== FALSE) {
-        if (empty(array_filter($row))) {
-            continue; // skip empty lines
-        }
-
-        if (count($row) !== count($headers)) {
-            continue; // skip malformed
-        }
-
-        $combined = array_combine($headers, $row);
-        $amountRaw = str_replace(',', '', $combined['Amount'] ?? '0');
-
-        $dataToAppend[] = [
-            'original_index'     => ($baseId * 10) + $recordCount,
-            'tra_id'             => $combined['Id'] ?? '-',
-            'tra_voucher_number' => $combined['Voucher No'] ?? '-',
-            'narration'          => $combined['Narration'] ?? '',
-            'date'               => $combined['Date'] ?? '',
-            'amount'             => (float)$amountRaw,
-            'type'               => ($combined['Cr/Dr'] ?? 'Dr.') === 'Cr.' ? 'Credit' : 'Debit',
-            'manual_verified'    => true,
-            'from_unmatched'     => true,
-        ];
-
-        $recordCount++;
-    }
-       dd($dataToAppend);
-
-    fclose($handle);
-
-    if ($recordCount === 0) {
-        Notification::make()
-            ->title('⚠️ No Records Found')
-            ->body('The uploaded CSV is empty or invalid.')
-            ->warning()
+            ->title('⚠️ Could not read uploaded backup file.')
+            ->danger()
             ->send();
         return;
     }
 
-    // ✅ Convert matched list to plain array before appending
-    $existingMatched = collect($this->results['matched'])->toArray();
-
-    // ✅ Merge *all* rows, reindex, and reassign back to $this->results
-    $mergedMatched = array_values(array_merge($existingMatched, $dataToAppend));
-
-    $this->results['matched'] = $mergedMatched;
-    $this->matchedCount = count($mergedMatched);
-
-    // ✅ Make sure Livewire sees it as a new array (not cached)
-    $this->results = array_merge($this->results);
-
-    // ✅ Refresh the tables
-    $this->refreshTables();
-
-    Notification::make()
-        ->title('✅ Backup Uploaded')
-        ->body("{$recordCount} record(s) successfully appended to the matched list.")
-        ->success()
-        ->send();
-
-    // ✅ Clear the uploaded file
-    $this->backup_file = null;
-}
-public function parseBackupCsv($fileObject): array
-{
- 
-
-    $rows = [];
-    $filePath = $fileObject->getRealPath();
-
-    if (($handle = fopen($filePath, "r")) === FALSE) {
-        return [];
+    $handle = fopen($filePath, 'r');
+    if (!$handle) {
+        Notification::make()
+            ->title('⚠️ Failed to open file.')
+            ->danger()
+            ->send();
+        return;
     }
 
     $headers = fgetcsv($handle);
     if (!$headers) {
         fclose($handle);
-        return [];
-    }
-
-    $baseId = random_int(100000000, 999999999);
-    $count = 0;
-
-    while (($row = fgetcsv($handle)) !== FALSE) {
-        if (empty(array_filter($row))) {
-            continue;
-        }
-        if (count($row) !== count($headers)) {
-            continue;
-        }
-
-        $combined = array_combine($headers, $row);
-        $amountRaw = str_replace(',', '', $combined['Amount'] ?? '0');
-
-        $rows[] = [
-            'original_index'     => ($baseId * 10) + $count,
-            'tra_id'             => $combined['Id'] ?? '-',
-            'tra_voucher_number' => $combined['Voucher No'] ?? '-',
-            'narration'          => $combined['Narration'] ?? '',
-            'date'               => $combined['Date'] ?? '',
-            'amount'             => (float)$amountRaw,
-            'type'               => ($combined['Cr/Dr'] ?? 'Dr.') === 'Cr.' ? 'Credit' : 'Debit',
-            'manual_verified'    => true,
-            'from_unmatched'     => true,
-        ];
-
-        $count++;
-    }
-
-    fclose($handle);
-    return $rows;
-}
-
-public function appendBackupRows(): void
-{
-    if (empty($this->pendingBackupRows)) {
         Notification::make()
-            ->title('⚠️ No Records Found')
-            ->body('The uploaded file was empty or invalid.')
-            ->warning()
+            ->title('⚠️ Invalid CSV headers.')
+            ->danger()
             ->send();
         return;
     }
 
-    // ✅ Merge and reassign to force Livewire update
-    $merged = array_values(array_merge($this->results['matched'] ?? [], $this->pendingBackupRows));
+    $rows = [];
+    $recordCount = 0;
+    $baseId = random_int(100000000, 999999999);
 
-    $this->results['matched'] = $merged;
-    $this->matchedCount = count($merged);
-    $this->results = array_merge($this->results);
+    while (($row = fgetcsv($handle)) !== false) {
+        if (count($row) !== count($headers)) continue;
 
+        $combined = array_combine($headers, $row);
+        $amountRaw = str_replace(',', '', $combined['amount'] ?? $combined['Amount'] ?? '0');
+
+        $rows[] = [
+            'original_index'     => ($baseId * 10) + $recordCount,
+            'tra_id'             => $combined['tra_id'] ?? $combined['Id'] ?? '-',
+            'tra_voucher_number' => $combined['tra_voucher_number'] ?? $combined['Voucher No'] ?? '-',
+            'narration'          => $combined['narration'] ?? $combined['Narration'] ?? '',
+            'date'               => $combined['date'] ?? $combined['Date'] ?? '',
+            'amount'             => (float)$amountRaw,
+            'type'               => ($combined['type'] ?? $combined['Cr/Dr'] ?? 'Dr.') === 'Cr.' ? 'Credit' : 'Debit',
+            'manual_verified'    => true,
+            'from_unmatched'     => true,
+        ];
+        $recordCount++;
+    }
+    fclose($handle);
+
+    if (empty($rows)) {
+        Notification::make()
+            ->title('⚠️ No valid rows found in backup file.')
+            ->danger()
+            ->send();
+        return;
+    }
+
+    // ✅ Keep appended rows in a dedicated property
+    $this->manualMatched = array_merge($this->manualMatched, $rows);
+
+    // ✅ Merge once with results safely
+    $this->results['matched'] = array_merge($this->results['matched'] ?? [], $this->manualMatched);
+
+    $this->matchedCount = count($this->results['matched']);
+    $this->unmatchedCount = count($this->results['unmatched'] ?? []);
     $this->refreshTables();
 
     Notification::make()
         ->title('✅ Backup Uploaded')
-        ->body(count($this->pendingBackupRows) . ' record(s) appended to matched list.')
+        ->body("{$recordCount} manual records appended.")
         ->success()
         ->send();
 
-    // Clear buffer
-    $this->pendingBackupRows = [];
+    $this->backup_file = null;
 }
+
+
+
+
+
 
 
 
@@ -796,13 +697,7 @@ private function refreshTables(): void
 
 
 
-    // 🆕 Helper to re-index sl_no and update counts
-    protected function reindexResults(): void
-    {
-        $this->results['matched'] = array_values($this->results['matched']);
-        $this->results['unmatched'] = array_values($this->unmatchedMap);
-    }
-
+    
 
 // REMOVE: The old, incorrect updateCounts method
 // private function updateCounts()
@@ -916,30 +811,45 @@ private function refreshTables(): void
                     ])
                     ->modalSubmitActionLabel('Upload')
                     ->action(function (array $data) {
-        
-                            // 🎯 FIX: Change the retrieval key to match the FileUpload::make('backup_file')
-                        $fileObject = $data['backup_file'] ?? null; 
-                        
-                        // Check if the file object exists and is the correct type
-                        if (!$fileObject || !($fileObject instanceof \Livewire\Features\SupportFileUploads\TemporaryUploadedFile)) {
-                            Notification::make()
-                                ->title('❌ Upload Failed')
-                                ->body('Please select a valid backup file to upload.')
-                                ->danger()
-                                ->send();
-                            return; 
-                        }
+        // ✅ Read file content manually, not reactively
+        $fileObject = $data['backup_file'] ?? null;
 
-                       // ✅ Process and store in buffer
-                        $this->pendingBackupRows = $this->parseBackupCsv($fileObject);
+        if (!$fileObject || !method_exists($fileObject, 'getRealPath')) {
+            Notification::make()
+                ->title('❌ Upload Failed')
+                ->body('Please select a valid backup file to upload.')
+                ->danger()
+                ->send();
+            return;
+        }
 
-                        // ✅ Append after parsing completes
-                        if (!empty($this->pendingBackupRows)) {
-                            $this->appendBackupRows();
-                        }
+        $filePath = $fileObject->getRealPath();
+        if (!$filePath || !file_exists($filePath)) {
+            Notification::make()
+                ->title('⚠️ File missing or unreadable.')
+                ->danger()
+                ->send();
+            return;
+        }
 
-                        $this->backup_file = null;
-                    }),
+        // ✅ Read full file content at once
+        $csvData = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+
+        if (count($csvData) <= 1) {
+            Notification::make()
+                ->title('⚠️ Backup file is empty.')
+                ->danger()
+                ->send();
+            return;
+        }
+
+        // Pass parsed content directly to uploadBackup() using public property
+        $this->backup_file = $fileObject;
+
+        // ✅ Call uploadBackup() AFTER file is fully read
+        $this->uploadBackup();
+    }),
+
             ])
             ->label('Actions')
             ->icon('heroicon-m-ellipsis-vertical')
