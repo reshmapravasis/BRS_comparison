@@ -277,12 +277,13 @@ class CBrsComparison extends Page implements  HasTable
             }
         }
         $getType = function ($amount) {
-            return substr(trim((string) $amount), 0, 1) === '+' ? 'Cr' : 'Dr';
+            return ((float) $amount) > 0 ? 'Cr' : 'Dr';
         };
 
        // 🆕 Build Matched Results
         $this->results['matched'] = $matched->values()->map(function ($row, $index) use ($getType) {
             $amount = $row['tra_amount'] ?? 0;
+            $type = $getType($amount);
             return [
                 'original_index' => $row['original_index'] ?? $index,
                 'tra_id' => $row['tra_id'],
@@ -290,8 +291,8 @@ class CBrsComparison extends Page implements  HasTable
                 'narration' => $row['tra_narration'] ?? '',
                 'date' => $row['tra_date'] ?? '',
                 'amount' => $amount,
-                'type' => $getType($amount),
-                'color' => $getType === 'Cr' ? 'text-green-600' : 'text-red-600',
+                'type' => $type,
+                'color' => $type === 'Cr' ? 'text-green-600' : 'text-red-600',
                 'manual_verified' => false, // ✅ system matched
                 'from_unmatched' => false,  // ✅ flag to detect later
             ];
@@ -709,7 +710,7 @@ class CBrsComparison extends Page implements  HasTable
 
                 TextColumn::make('type')
                     ->label('Cr/Dr')
-                    ->color(fn($record) => ($record['amount'] ?? 0) > 0 ? 'success' : 'danger'),
+                    ->color(fn($record) => (($record['type'] ?? '') === 'Cr') ? 'success' : 'danger'),
                 // TextColumn::make('original_index')
                 //         ->label('Original Index')
                 //         ->sortable()
