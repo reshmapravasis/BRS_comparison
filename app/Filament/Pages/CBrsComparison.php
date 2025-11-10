@@ -752,7 +752,7 @@ class CBrsComparison extends Page implements  HasTable
             Action::make('export_unmatched')
                 ->label('Export Unmatched')
                 ->icon('heroicon-o-document-arrow-down')
-                ->color('primary')
+                ->color('success')
                 ->button()
                 ->visible(fn () => $this->viewMode === 'unmatched')
                 ->action(fn () => $this->exportCurrentViewToCsv('unmatched')),
@@ -808,7 +808,7 @@ class CBrsComparison extends Page implements  HasTable
             default => 'Action',
         })
         ->color(fn ($record) => match($this->viewMode) {
-            'matched' => ($record['from_unmatched'] ?? false) ? 'danger' : 'success',
+            'matched' => ($record['from_unmatched'] ?? false) ? 'danger' : 'info',
             'unmatched' => 'primary',
             default => 'secondary',
         })
