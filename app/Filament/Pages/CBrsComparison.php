@@ -353,70 +353,71 @@ class CBrsComparison extends Page implements  HasTable
     }
      
     public function verifyTransaction(int $originalIndex): void
-    {
-        if (!isset($this->unmatchedMap[$originalIndex])) return;
+{
+    if (!isset($this->unmatchedMap[$originalIndex])) return;
 
-        $item = $this->unmatchedMap[$originalIndex];
-        
-        // ✅ MUST be this reactive method to force Livewire to see the change
-        $this->unmatchedMap = collect($this->unmatchedMap)
-                                ->forget($originalIndex)
-                                ->toArray(); 
-        
-        // Move to matched
-        $item['from_unmatched'] = true;
-        $item['manual_verified'] = true;
-        array_push($this->results['matched'], $item);
+    $item = $this->unmatchedMap[$originalIndex];
 
-        $this->refreshTables(); // Triggers $this->dispatch('$refresh')
+    // Remove from unmatchedMap
+    $this->unmatchedMap = collect($this->unmatchedMap)
+        ->forget($originalIndex)
+        ->toArray();
 
-        Notification::make()
-            ->title('✅ Verified')
-            ->body('Transaction moved to matched list.')
-            ->success()
-            ->send();
-    }
+    // Move to matched
+    $item['from_unmatched'] = true;
+    $item['manual_verified'] = true;
+
+    $this->results['matched'][] = $item;
+
+    // Keep results['unmatched'] in sync
+    $this->results['unmatched'] = array_values($this->unmatchedMap);
+
+    $this->refreshTables(); // Force Livewire to refresh
+
+    Notification::make()
+        ->title('✅ Verified')
+        ->body('Transaction moved to matched list.')
+        ->success()
+        ->send();
+}
+
     public function revertTransaction(int $originalIndex): void
-    {
-        // Find and remove from matched
-        $keyToRemove = null;
-        $itemToRevert = null;
+{
+    $recordKey = null;
 
-        foreach ($this->results['matched'] as $key => $item) {
-            if (($item['original_index'] ?? null) == $originalIndex) {
-                $keyToRemove = $key;
-                $itemToRevert = $item;
-                break;
-            }
+    // Find the record in matched
+    foreach ($this->results['matched'] as $key => $row) {
+        if (($row['original_index'] ?? null) === $originalIndex) {
+            $recordKey = $key;
+            break;
         }
-
-        if (is_null($keyToRemove)) return;
-
-        unset($this->results['matched'][$keyToRemove]);
-
-        // Mark as unverified
-        $itemToRevert['from_unmatched'] = false;
-        $itemToRevert['manual_verified'] = false;
-
-        // Restore in the exact same position by index key
-        $this->unmatchedMap[$originalIndex] = $itemToRevert;
-        ksort($this->unmatchedMap);
-
-        // Force full array re-assignment
-        $this->results['unmatched'] = array_values($this->unmatchedMap);
-        $this->results['matched'] = array_values($this->results['matched']);
-
-        $this->matchedCount = count($this->results['matched']);
-        $this->unmatchedCount = count($this->results['unmatched']);
-
-        $this->dispatch('$refresh');
-
-        Notification::make()
-            ->title('↩️ Reverted')
-            ->body('Transaction restored to its original place.')
-            ->success()
-            ->send();
     }
+
+    if ($recordKey === null) return;
+
+    $item = $this->results['matched'][$recordKey];
+
+    // Remove from matched
+    unset($this->results['matched'][$recordKey]);
+    $this->results['matched'] = array_values($this->results['matched']);
+
+    // Add back to unmatchedMap
+    $item['from_unmatched'] = false;
+    $item['manual_verified'] = false;
+    $this->unmatchedMap[$originalIndex] = $item;
+
+    // Sync with results['unmatched']
+    $this->results['unmatched'] = array_values($this->unmatchedMap);
+
+    $this->refreshTables();
+
+    Notification::make()
+        ->title('↩️ Reverted')
+        ->body('Transaction moved back to unmatched list.')
+        ->success()
+        ->send();
+}
+
 
     public function downloadManualBackup(): ?StreamedResponse
     {
@@ -708,7 +709,7 @@ class CBrsComparison extends Page implements  HasTable
 
                 TextColumn::make('type')
                     ->label('Cr/Dr')
-                    ->color(fn($record) => ($record['tra_amount'] ?? 0) > 0 ? 'success' : 'danger'),
+                    ->color(fn($record) => ($record['amount'] ?? 0) > 0 ? 'success' : 'danger'),
                 // TextColumn::make('original_index')
                 //         ->label('Original Index')
                 //         ->sortable()
@@ -737,134 +738,99 @@ class CBrsComparison extends Page implements  HasTable
 
         
         ->headerActions([
-            // New Grouped Action
-            ActionGroup::make([
+            // ✅ Export Matched
+            Action::make('export_matched')
+                ->label('Export Matched')
+                ->icon('heroicon-o-document-arrow-down')
+                ->color('success')
+                ->button()
+                ->visible(fn () => $this->viewMode === 'matched')
+                ->action(fn () => $this->exportCurrentViewToCsv('matched')),
 
-                // 1. Normal Export (matched List)
-                Action::make('export_matched')
-                    ->label('Export CSV')
-                    ->icon('heroicon-o-document-arrow-down')
-                    ->color('success')
-                    ->button()
-                    ->visible(fn () => $this->viewMode === 'matched') // Only visible in unmatched view
-                    ->action(fn () => $this->exportCurrentViewToCsv('matched')),
-                // 2. Normal Export (Unmatched List)
-                 Action::make('export_unmatched')
-                    ->label('Export CSV')
-                    ->icon('heroicon-o-document-arrow-down')
-                    ->color('primary')
-                    ->button()
-                    ->visible(fn () => $this->viewMode === 'unmatched') // Only visible in unmatched view
-                    ->action(fn () => $this->exportCurrentViewToCsv('unmatched')),
-                    //->color('info'),
-                
-                // 3. Download Manual Backup (Matched List)
-                Action::make('download_manual_backup')
-                    ->label('Download Backup')
-                    ->icon('heroicon-o-cloud-arrow-down')
-                    ->color('warning')
-                    ->button()
-                    ->visible(fn () => $this->viewMode === 'matched') // Only visible in matched view
-                    ->action('downloadManualBackup'),
+            // ✅ Export Unmatched
+            Action::make('export_unmatched')
+                ->label('Export Unmatched')
+                ->icon('heroicon-o-document-arrow-down')
+                ->color('primary')
+                ->button()
+                ->visible(fn () => $this->viewMode === 'unmatched')
+                ->action(fn () => $this->exportCurrentViewToCsv('unmatched')),
 
-                //4. Upload Backup (Matched List) - Uses a modal for file upload
-                Action::make('upload_backup')
-                    ->label('Upload Backup')
-                    ->icon('heroicon-o-cloud-arrow-up')
-                    ->color('info')
-                    ->button()
-                    ->visible(fn () => $this->viewMode === 'matched') // Only visible in matched view
-                    ->form([
-                        FileUpload::make('backup_file')
-                            ->label('Upload Backup File')
-                            ->required()
-                            ->storeFiles(false)
-                            ->preserveFilenames()
-                            ->acceptedFileTypes(['text/csv'])
-                            ->live(), // Bind to the backup_file property
-                    ])
-                    ->modalSubmitActionLabel('Upload')
-                    ->action(function (array $data) {
-                        // ✅ Read file content manually, not reactively
-                        $fileObject = $data['backup_file'] ?? null;
+            // ✅ Download Backup
+            Action::make('download_manual_backup')
+                ->label('Download Backup')
+                ->icon('heroicon-o-cloud-arrow-down')
+                ->color('warning')
+                ->button()
+                ->visible(fn () => $this->viewMode === 'matched')
+                ->action('downloadManualBackup'),
 
-                        if (!$fileObject || !method_exists($fileObject, 'getRealPath')) {
-                            Notification::make()
-                                ->title('❌ Upload Failed')
-                                ->body('Please select a valid backup file to upload.')
-                                ->danger()
-                                ->send();
-                            return;
-                        }
-
-                        $filePath = $fileObject->getRealPath();
-                        if (!$filePath || !file_exists($filePath)) {
-                            Notification::make()
-                                ->title('⚠️ File missing or unreadable.')
-                                ->danger()
-                                ->send();
-                            return;
-                        }
-
-                        // ✅ Read full file content at once
-                        $csvData = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-
-                        if (count($csvData) <= 1) {
-                            Notification::make()
-                                ->title('⚠️ Backup file is empty.')
-                                ->danger()
-                                ->send();
-                            return;
-                        }
-
-                        // Pass parsed content directly to uploadBackup() using public property
-                        $this->backup_file = $fileObject;
-
-                        // ✅ Call uploadBackup() AFTER file is fully read
-                        $this->uploadBackup();
-                    }),
-
-            ])
-            ->label('Actions')
-            ->icon('heroicon-m-ellipsis-vertical')
-            ->button()
-            ->color('gray')
-            ->visible(fn () => $this->ledgerCount > 0), // Show only when data exists
+            // ✅ Upload Backup
+            Action::make('upload_backup')
+                ->label('Upload Backup')
+                ->icon('heroicon-o-cloud-arrow-up')
+                ->color('info')
+                ->button()
+                ->visible(fn () => $this->viewMode === 'matched')
+                ->form([
+                    FileUpload::make('backup_file')
+                        ->label('Upload Backup File')
+                        ->required()
+                        ->storeFiles(false)
+                        ->preserveFilenames()
+                        ->acceptedFileTypes(['text/csv'])
+                        ->live(),
+                ])
+                ->modalSubmitActionLabel('Upload')
+                ->action(function (array $data) {
+                    $fileObject = $data['backup_file'] ?? null;
+                    if (!$fileObject || !method_exists($fileObject, 'getRealPath')) {
+                        Notification::make()
+                            ->title('❌ Upload Failed')
+                            ->body('Please select a valid backup file.')
+                            ->danger()
+                            ->send();
+                        return;
+                    }
+                    $this->backup_file = $fileObject;
+                    $this->uploadBackup();
+                }),
         ])
+
 
         // 🆕 Add table actions
             ->actions([
-                Action::make('verify')
-                    ->label('Verify')
-                    ->color('success')
-                    ->button()
-                    //->requiresConfirmation()
-                    ->visible(fn ($record) =>
-                        $this->viewMode === 'unmatched' && is_array($record)
-                    )
-                    ->action(function ($record) {
-                        if (is_array($record) && isset($record['original_index'])) {
-                            $this->verifyTransaction($record['original_index']);
-                        }
-                    }),
+          Action::make('verify_or_revert')
+        ->label(fn ($record) => match($this->viewMode) {
+            'matched' => ($record['from_unmatched'] ?? false) ? 'Revert' : 'Verified',
+            'unmatched' => 'Verify',
+            default => 'Action',
+        })
+        ->color(fn ($record) => match($this->viewMode) {
+            'matched' => ($record['from_unmatched'] ?? false) ? 'danger' : 'success',
+            'unmatched' => 'primary',
+            default => 'secondary',
+        })
+        ->button()
+        ->disabled(fn ($record) => 
+            ($this->viewMode === 'matched' && !($record['from_unmatched'] ?? false))
+        )
+        ->action(function ($record) {
+            $originalIndex = $record['original_index'] ?? null;
+            if (!$originalIndex) return;
 
-                // ✅ REVERT only for manually verified rows in matched
-                Action::make('revert')
-                    ->label('Revert')
-                    ->color('warning')
-                    ->button()
-                   // ->requiresConfirmation()
-                    ->visible(fn($record) =>
-                        $this->viewMode === 'matched'
-                        && is_array($record)
-                        && ($record['from_unmatched'] ?? false) === true
-                    )
-                    ->action(function ($record) {
-                        if (is_array($record) && isset($record['original_index'])) {
-                            $this->revertTransaction($record['original_index']);
-                        }
-                    }),
-                ]);
+            if ($this->viewMode === 'unmatched') {
+                // Move from unmatched to matched
+                $this->verifyTransaction($originalIndex);
+            } elseif ($this->viewMode === 'matched' && ($record['from_unmatched'] ?? false)) {
+                // Move back from matched to unmatched
+                $this->revertTransaction($originalIndex);
+            }
+
+            session()->put('brs_results', $this->results);
+            $this->resetTable();
+        }),
+            ]);
     }
 
     private function readFile(string $filePath, string $ext): \Illuminate\Support\Collection

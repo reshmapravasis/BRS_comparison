@@ -37,7 +37,7 @@
                 </x-filament::button>
 
                 <x-filament::button
-                    color="{{ $this->viewMode === 'unmatched_ledger' ? 'warning' : 'gray' }}"
+                    color="{{ $this->viewMode === 'unmatched_ledger' ? 'danger' : 'gray' }}"
                     wire:click="toggleView('unmatched_ledger')"
                     :disabled="empty($this->results['unmatched_ledger'])"
                 >

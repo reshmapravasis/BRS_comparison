@@ -21,6 +21,7 @@ use PhpOffice\PhpSpreadsheet\IOFactory;
 use Filament\Forms\Form;
 use Filament\Actions\Action;
 use Filament\Actions\ActionGroup;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 
 class IBrsComparison extends Page implements HasForms, HasTable
@@ -331,6 +332,184 @@ class IBrsComparison extends Page implements HasForms, HasTable
     return [$matched, $unmatchedLedger, $finalUnmatchedBank];
 }
 
+public function uploadBackup(): void
+    {
+        if (empty($this->backup_file) || !method_exists($this->backup_file, 'getRealPath')) {
+            Notification::make()
+                ->title('❌ Upload Failed')
+                ->body('No valid backup file selected.')
+                ->danger()
+                ->send();
+            return;
+        }
+
+        $filePath = $this->backup_file->getRealPath();
+        if (!$filePath || !file_exists($filePath)) {
+            Notification::make()
+                ->title('⚠️ File not found.')
+                ->danger()
+                ->send();
+            return;
+        }
+
+        $rows = array_map('str_getcsv', file($filePath));
+        array_shift($rows); // remove header row
+
+        $imported = 0;
+        foreach ($rows as $row) {
+            if (count($row) < 4) continue;
+
+            [$date, $narration, $amount, $type, $uid] = array_pad($row, 5, null);
+
+            $this->results['matched'][] = [
+                'tra_date' => $date,
+                'tra_narration' => $narration,
+                'tra_amount' => (float) $amount,
+                'tra_type' => $type,
+                'uid' => $uid ?? (string) \Illuminate\Support\Str::uuid(),
+                'moved_from_unmatched' => true,
+                'manual_verified' => true,
+            ];
+
+            $imported++;
+        }
+
+        if ($imported > 0) {
+            Notification::make()
+                ->title('✅ Backup Imported')
+                ->body("$imported records restored into the matched list.")
+                ->success()
+                ->send();
+        } else {
+            Notification::make()
+                ->title('⚠️ Backup Empty')
+                ->body('No valid records found in uploaded CSV.')
+                ->warning()
+                ->send();
+        }
+
+        $this->matchedCount = count($this->results['matched']);
+        $this->resetTable();
+    }
+    
+
+    public function exportCurrentViewToCsv(string $mode): \Symfony\Component\HttpFoundation\StreamedResponse
+    {
+        $dataToExport = $this->results[$mode] ?? [];
+
+    if (empty($dataToExport)) {
+        Notification::make()
+            ->title("⚠️ No Data Found")
+            ->body("No records available in the selected list ({$mode}).")
+            ->warning()
+            ->send();
+
+        return response()->stream(fn() => '', 200, [
+            'Content-Type' => 'text/plain',
+        ]);
+    }
+
+    $fileName = "{$mode}_transactions_" . date('Ymd_His') . '.csv';
+    $headers = [
+        'Content-Type' => 'text/csv',
+        'Content-Disposition' => "attachment; filename=\"$fileName\"",
+    ];
+
+    $callback = function () use ($dataToExport, $mode) {
+        $file = fopen('php://output', 'w');
+
+        // Headers
+        if ($mode === 'matched') {
+            fputcsv($file, [
+                'Sl No', 'Date', 'Narration', 'Amount', 'Cr/Dr',
+                'Match Date', 'Match Narration', 'Match Amount', 'Match Type',
+                'Manual Verified', 'From Unmatched'
+            ]);
+        } else {
+            fputcsv($file, [
+                'Sl No', 'Date', 'Narration', 'Amount', 'Cr/Dr', 'Reason'
+            ]);
+        }
+
+        // Rows
+        $sl = 1;
+        foreach ($dataToExport as $row) {
+            if ($mode === 'matched') {
+                fputcsv($file, [
+                    $sl++,
+                    $row['tra_date'] ?? '',
+                    $row['tra_narration'] ?? '',
+                    $row['tra_amount'] ?? '',
+                    $row['tra_type'] ?? '',
+                    $row['match_date'] ?? '',
+                    $row['match_narration'] ?? '',
+                    $row['match_amount'] ?? '',
+                    $row['match_type'] ?? '',
+                    ($row['manual_verified'] ?? false) ? 'Yes' : 'No',
+                    ($row['from_unmatched'] ?? false) ? 'Yes' : 'No',
+                ]);
+            } else {
+                fputcsv($file, [
+                    $sl++,
+                    $row['date'] ?? '',
+                    $row['narration'] ?? '',
+                    $row['amount'] ?? '',
+                    $row['type'] ?? '',
+                    // $row['reason'] ?? '',
+                ]);
+            }
+        }
+
+        fclose($file);
+    };
+
+    return response()->stream($callback, 200, $headers);
+}
+public function downloadManualBackup(): ?StreamedResponse
+{
+    $manualData = collect($this->results['matched'] ?? [])
+        ->filter(fn($row) => ($row['moved_from_unmatched'] ?? false))
+        ->values()
+        ->toArray();
+
+    if (empty($manualData)) {
+        Notification::make()
+            ->title('⚠️ No Manually Verified Data')
+            ->body('There are no manually matched entries to back up.')
+            ->warning()
+            ->send();
+
+        return response()->stream(fn() => '', 200, ['Content-Type' => 'text/plain']);
+    }
+
+    $fileName = 'manual_matched_backup_' . date('Ymd_His') . '.csv';
+    $headers = [
+        'Content-Type' => 'text/csv',
+        'Content-Disposition' => "attachment; filename=\"$fileName\"",
+    ];
+
+    $callback = function () use ($manualData) {
+        $file = fopen('php://output', 'w');
+        fputcsv($file, ['Date', 'Narration', 'Amount', 'Cr/Dr', 'UID']);
+
+        foreach ($manualData as $row) {
+            fputcsv($file, [
+                $row['tra_date'] ?? '',
+                $row['tra_narration'] ?? '',
+                $row['tra_amount'] ?? '',
+                $row['tra_type'] ?? '',
+                // $row['uid'] ?? '',
+            ]);
+        }
+
+        fclose($file);
+    };
+
+    return response()->stream($callback, 200, $headers);
+}
+
+
+
 
 
   public function table(Table $table): Table
@@ -382,58 +561,136 @@ class IBrsComparison extends Page implements HasForms, HasTable
     };
     
     // ✅ Add row actions instead of HTML buttons
-    $actions = [
-        Action::make('verify')
-            ->label(function ($record) {
-                return $this->viewMode === 'matched'
-                    ? (($record['moved_from_unmatched'] ?? false) ? 'Revert' : 'Verified')
-                    : 'Verify';
-            })
-            ->color(function ($record) {
-                if ($this->viewMode === 'matched') {
-                    return ($record['moved_from_unmatched'] ?? false) ? 'danger' : 'success';
-                }
-                return 'primary';
-            })
-            ->button() // ✅ Makes it look like a real button (not a link)
-            ->outlined(false) // solid color button
-            ->disabled(function ($record) {
-                // Disable when "Verified" (not moved_from_unmatched)
-                return $this->viewMode === 'matched' && empty($record['moved_from_unmatched']);
-            })
-            ->action(function ($record) {
-                if ($this->viewMode === 'unmatched_ledger') {
-                    $this->verifyRow($record);
-                } elseif ($this->viewMode === 'matched' && ($record['moved_from_unmatched'] ?? false)) {
-                    $this->revertRow($record);
-                }
-            }),
-            
-    ];
     
+$actions = [
+    Action::make('verify')
+        ->label(function ($record) {
+            return $this->viewMode === 'matched'
+                ? (($record['moved_from_unmatched'] ?? false) ? 'Revert' : 'Verified')
+                : 'Verify';
+        })
+        ->color(function ($record) {
+            if ($this->viewMode === 'matched') {
+                return ($record['moved_from_unmatched'] ?? false) ? 'danger' : 'success';
+            }
+            return 'primary';
+        })
+        ->button()
+        ->outlined(false)
+        ->disabled(function ($record) {
+            // Disable when "Verified" (not moved_from_unmatched)
+            return $this->viewMode === 'matched' && empty($record['moved_from_unmatched']);
+        })
+        ->action(function ($record) {
+            // IMPORTANT: pass the uid string (not the whole record)
+            $uid = $record['uid'] ?? null;
+            if (!$uid) return;
+
+            if ($this->viewMode === 'unmatched_ledger') {
+                $this->verifyRow($uid);
+            } elseif ($this->viewMode === 'matched' && ($record['moved_from_unmatched'] ?? false)) {
+                $this->revertRow($uid);
+            }
+
+            // persist and refresh table
+            session()->put('brs_results', $this->results);
+            $this->resetTable();
+        }),
+];
+
 
     return $table
         ->records(fn() => collect($data))
         ->columns($columns)
         ->actions($actions)
         ->headerActions([
-            ActionGroup::make([
+                // 1️⃣ Export Matched CSV
                 Action::make('export_matched')
-                    ->label('Export CSV')
+                    ->label('Export Matched')
                     ->icon('heroicon-o-document-arrow-down')
                     ->color('success')
                     ->button()
                     ->visible(fn () => $this->viewMode === 'matched')
                     ->action(fn () => $this->exportCurrentViewToCsv('matched')),
 
+                // 2️⃣ Export Unmatched CSV (Ledger)
+                Action::make('export_unmatched_ledger')
+                    ->label('Export Unmatched')
+                    ->icon('heroicon-o-document-arrow-down')
+                    ->color('primary')
+                    ->button()
+                    ->visible(fn () => $this->viewMode === 'unmatched_ledger')
+                    ->action(fn () => $this->exportCurrentViewToCsv('unmatched_ledger')),
+
+                // 3️⃣ Export Unmatched Bank CSV
+                Action::make('export_unmatched_bank')
+                    ->label('Export Unmatched Bank CSV')
+                    ->icon('heroicon-o-document-arrow-down')
+                    ->color('info')
+                    ->button()
+                    ->visible(fn () => $this->viewMode === 'unmatched_bank')
+                    ->action(fn () => $this->exportCurrentViewToCsv('unmatched_bank')),
+
+                // 4️⃣ Download Manual Backup
                 Action::make('download_manual_backup')
                     ->label('Download Backup')
                     ->icon('heroicon-o-cloud-arrow-down')
-                    ->button()
                     ->color('warning')
+                    ->button()
                     ->visible(fn () => $this->viewMode === 'matched')
-                    ->action('downloadManualBackup'),
-            ])
+                    ->action(fn () => $this->downloadManualBackup()),
+
+                // 5️⃣ Upload Backup (opens modal)
+                Action::make('upload_backup')
+                    ->label('Upload Backup')
+                    ->icon('heroicon-o-cloud-arrow-up')
+                    ->color('info')
+                    ->button()
+                    ->visible(fn () => $this->viewMode === 'matched')
+                    ->form([
+                        FileUpload::make('backup_file')
+                            ->label('Upload Backup File')
+                            ->required()
+                            ->storeFiles(false)
+                            ->preserveFilenames()
+                            ->acceptedFileTypes(['text/csv'])
+                            ->live(),
+                    ])
+                    ->modalSubmitActionLabel('Upload')
+                    ->action(function (array $data) {
+                        $fileObject = $data['backup_file'] ?? null;
+
+                        if (!$fileObject || !method_exists($fileObject, 'getRealPath')) {
+                            Notification::make()
+                                ->title('❌ Upload Failed')
+                                ->body('Please select a valid backup file to upload.')
+                                ->danger()
+                                ->send();
+                            return;
+                        }
+
+                        $filePath = $fileObject->getRealPath();
+                        if (!$filePath || !file_exists($filePath)) {
+                            Notification::make()
+                                ->title('⚠️ File missing or unreadable.')
+                                ->danger()
+                                ->send();
+                            return;
+                        }
+
+                        $csvData = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+
+                        if (count($csvData) <= 1) {
+                            Notification::make()
+                                ->title('⚠️ Backup file is empty.')
+                                ->danger()
+                                ->send();
+                            return;
+                        }
+
+                        $this->backup_file = $fileObject;
+                        $this->uploadBackup();
+                    }),
         ])
         ->paginated([10, 25, 50, 100])
         ->defaultSort(match ($this->viewMode) {
@@ -444,10 +701,21 @@ class IBrsComparison extends Page implements HasForms, HasTable
 
 }
 
+// --- replace verifyRow(...) with this ---
 public function verifyRow($uid)
 {
-    $record = collect($this->results['unmatched_ledger'])->firstWhere('uid', $uid);
+    // $uid should be a string
+    $record = collect($this->results['unmatched_ledger'] ?? [])->firstWhere('uid', $uid);
     if (!$record) return;
+
+    $originalIndex = null;
+    // find original index in unmatched_ledger
+    foreach ($this->results['unmatched_ledger'] as $i => $r) {
+        if (($r['uid'] ?? null) === $uid) {
+            $originalIndex = $i;
+            break;
+        }
+    }
 
     $item = [
         'tra_date' => $record['date'],
@@ -456,19 +724,29 @@ public function verifyRow($uid)
         'tra_type' => $record['type'],
         'uid' => $uid,
         'moved_from_unmatched' => true,
-        'original_index' => array_search($uid, array_column($this->results['unmatched_ledger'], 'uid')),
+        'original_index' => $originalIndex,
     ];
 
+    // add to matched and remove from unmatched_ledger
     $this->results['matched'][] = $item;
-    $this->results['unmatched_ledger'] = array_values(array_filter($this->results['unmatched_ledger'], fn($r) => $r['uid'] !== $uid));
+    $this->results['unmatched_ledger'] = array_values(array_filter(
+        $this->results['unmatched_ledger'],
+        fn($r) => ($r['uid'] ?? null) !== $uid
+    ));
 
     $this->matchedCount = count($this->results['matched']);
     $this->unmatchedCount = count($this->results['unmatched_ledger']);
+
+    // persist and refresh
+    session()->put('brs_results', $this->results);
+    $this->resetTable();
 }
 
+
+// --- replace revertRow(...) with this ---
 public function revertRow($uid)
 {
-    $record = collect($this->results['matched'])->firstWhere('uid', $uid);
+    $record = collect($this->results['matched'] ?? [])->firstWhere('uid', $uid);
     if (!$record) return;
 
     $item = [
@@ -479,12 +757,35 @@ public function revertRow($uid)
         'uid' => $uid,
     ];
 
-    $this->results['matched'] = array_values(array_filter($this->results['matched'], fn($r) => $r['uid'] !== $uid));
-    $this->results['unmatched_ledger'][] = $item;
+    // remove from matched
+    $this->results['matched'] = array_values(array_filter(
+        $this->results['matched'],
+        fn($r) => ($r['uid'] ?? null) !== $uid
+    ));
+
+    // restore into unmatched_ledger at original index if available,
+    // otherwise push at the end
+    $inserted = false;
+    $origIndex = $record['original_index'] ?? null;
+    if (is_int($origIndex) && $origIndex >= 0) {
+        $before = array_slice($this->results['unmatched_ledger'], 0, $origIndex);
+        $after  = array_slice($this->results['unmatched_ledger'], $origIndex);
+        $this->results['unmatched_ledger'] = array_values(array_merge($before, [$item], $after));
+        $inserted = true;
+    }
+
+    if (! $inserted) {
+        $this->results['unmatched_ledger'][] = $item;
+    }
 
     $this->matchedCount = count($this->results['matched']);
     $this->unmatchedCount = count($this->results['unmatched_ledger']);
+
+    // persist and refresh
+    session()->put('brs_results', $this->results);
+    $this->resetTable();
 }
+
 
 
 
