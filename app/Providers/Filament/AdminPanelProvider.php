@@ -28,6 +28,8 @@ class AdminPanelProvider extends PanelProvider
             ->id('admin')
             ->path('admin')
             ->brandName('BRS Comparison Tool')
+           ->brandLogo(asset('images/BRS_LOGO.png'))
+            ->brandLogoHeight('4rem') 
             ->login()
             ->colors([
                 'primary' => Color::Amber,

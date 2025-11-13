@@ -46,6 +46,7 @@ class IBrsComparison extends Page implements HasForms, HasTable
             'matched' => [],
             'unmatched_ledger' => [], // Clearer name
             'unmatched_bank' => [],
+            'duplicates' => [],
         ];
 
         public string $viewMode = 'matched'; // matched, unmatched, unmatched_bank
@@ -132,8 +133,9 @@ class IBrsComparison extends Page implements HasForms, HasTable
                 $ledgerData = $this->readFile($ledgerPath, 'ledger');
                 $bankData = $this->readFile($bankPath, 'bank');
 
-                [$matched, $unmatchedLedger, $unmatchedBank] =
-                    $this->compareTransactions($ledgerData, $bankData);
+                [$matched, $unmatchedLedger, $unmatchedBank, $duplicates] = $this->compareTransactions($ledgerData, $bankData);
+    
+
 
                 // ✅ Add unique UID + movement tracking to every row
                 $addUid = function ($rows, $isMatched = false) {
@@ -149,6 +151,7 @@ class IBrsComparison extends Page implements HasForms, HasTable
                 $this->results['matched'] = $addUid($matched, true);
                 $this->results['unmatched_ledger'] = $addUid($unmatchedLedger, false);
                 $this->results['unmatched_bank'] = $addUid($unmatchedBank, false);
+                $this->results['duplicates'] = $addUid($duplicates, false);
                 $this->totalLedgerEntries = is_countable($ledgerData) ? $ledgerData->count() : count($ledgerData);
                 $this->totalBankEntries   = is_countable($bankData) ? $bankData->count()   : count($bankData);
                 $this->matchedCount = count($matched);
@@ -236,244 +239,106 @@ class IBrsComparison extends Page implements HasForms, HasTable
         }
 
     protected function compareTransactions(Collection $ledgerData, Collection $bankData): array
-        {
-            $matched = [];
-            $unmatchedLedger = [];
+{
+    $matched = [];
+    $unmatchedLedger = [];
+    $duplicates = []; // ✅ new
+    $unmatchedBankArray = $bankData->toArray();
+    $bankIndicesUsed = [];
 
-            $unmatchedBankArray = $bankData->toArray();
-            $bankIndicesUsed = [];
+    $normalizeNarration = fn($t) => preg_replace('/[^a-z0-9]/i', '', strtolower((string) $t));
+    $normalizeAmount = fn($v) => number_format((float) str_replace([',', '(', ')', ' '], '', (string)$v), 2, '.', '');
+    $normalizeDate = fn($d) => ($ts = strtotime(trim((string)$d))) ? date('Y-m-d', $ts) : null;
+    $isDateClose = fn($d1, $d2) => !$d1 || !$d2 || abs(strtotime($d1) - strtotime($d2)) / 86400 <= 2;
 
-            // Helpers
-            $normalizeNarration = function ($text) {
-                $text = (string) $text;
-                $text = mb_strtolower($text);
-                $text = preg_replace('/[^a-z0-9]/i', '', $text);
-                return $text;
-            };
+    foreach ($ledgerData as $ledgerIndex => $ledgerLine) {
+        $foundMatch = false;
+        $ledgerAmount = $normalizeAmount($ledgerLine['amount_abs'] ?? $ledgerLine['amount'] ?? 0);
+        $ledgerNarration = $normalizeNarration($ledgerLine['narration'] ?? '');
+        $ledgerDate = $normalizeDate($ledgerLine['date'] ?? null);
 
-            $normalizeAmount = function ($val) {
-                $v = (string) $val;
-                $v = str_replace([',', '(', ')', ' '], '', $v);
-                return number_format((float) $v, 2, '.', '');
-            };
+        $possibleMatches = [];
+        foreach ($unmatchedBankArray as $bankIndex => $bankRec) {
+            $bankAmount = $normalizeAmount($bankRec['amount_abs'] ?? $bankRec['amount'] ?? 0);
+            if ($ledgerAmount !== $bankAmount) continue;
 
-            $normalizeDate = function ($d) {
-                $d = trim((string) $d);
-                if ($d === '') return null;
-                $ts = strtotime($d);
-                return $ts ? date('Y-m-d', $ts) : null;
-            };
+            $bankNarration = $normalizeNarration($bankRec['narration'] ?? '');
+            similar_text($ledgerNarration, $bankNarration, $similarity);
+            if ($similarity < 75) continue;
 
-            $isDateClose = function ($d1, $d2) {
-                if (!$d1 || !$d2) return true; // if one missing, ignore date
-                $diff = abs(strtotime($d1) - strtotime($d2)) / 86400;
-                return $diff <= 2; // within ±2 days
-            };
+            $bankDate = $normalizeDate($bankRec['date'] ?? null);
+            if (!$isDateClose($ledgerDate, $bankDate)) continue;
 
-            foreach ($ledgerData as $ledgerIndex => $ledgerLine) {
-                $foundMatch = false;
-
-                $ledgerAmount = $normalizeAmount($ledgerLine['amount_abs'] ?? $ledgerLine['amount'] ?? 0);
-                $ledgerNarration = $normalizeNarration($ledgerLine['narration'] ?? '');
-                $ledgerDate = $normalizeDate($ledgerLine['date'] ?? null);
-
-                foreach ($unmatchedBankArray as $bankIndex => $bankRec) {
-                    if (in_array($bankIndex, $bankIndicesUsed, true)) continue;
-
-                    $bankAmount = $normalizeAmount($bankRec['amount_abs'] ?? $bankRec['amount'] ?? 0);
-                    $bankNarration = $normalizeNarration($bankRec['narration'] ?? '');
-                    $bankDate = $normalizeDate($bankRec['date'] ?? null);
-
-                    // --- Amount Check ---
-                    if ($ledgerAmount !== $bankAmount) continue;
-
-                    // --- Narration Similarity ---
-                    similar_text($ledgerNarration, $bankNarration, $similarity);
-                    if ($similarity < 75) continue; // require ≥75% similarity
-
-                    // --- Date Check (±2 days allowed) ---
-                    if (!$isDateClose($ledgerDate, $bankDate)) continue;
-
-                    // ✅ It's a Match
-                    $matched[] = [
-                        'tra_date' => $ledgerLine['date'] ?? null,
-                        'tra_narration' => $ledgerLine['narration'] ?? '',
-                        'tra_amount' => $ledgerLine['amount_abs'] ?? $ledgerLine['amount'] ?? 0,
-                        'tra_type' => ($ledgerLine['amount'] ?? 0) > 0 ? 'Cr' : 'Dr',
-                        'match_date' => $bankRec['date'] ?? null,
-                        'match_narration' => $bankRec['narration'] ?? '',
-                        'match_amount' => $bankRec['amount_abs'] ?? $bankRec['amount'] ?? 0,
-                        'match_type' => ($bankRec['amount'] ?? 0) > 0 ? 'Credit (Bank)' : 'Debit (Bank)',
-                        'similarity' => round($similarity, 2),
-                        'match_method' => 'Amount + Narration (≥75%)',
-                    ];
-
-                    $bankIndicesUsed[] = $bankIndex;
-                    $foundMatch = true;
-                    break;
-                }
-
-                if (!$foundMatch) {
-                    $amount = $ledgerLine['amount_abs'] ?? $ledgerLine['amount'] ?? null;
-                    $narration = trim($ledgerLine['narration'] ?? '');
-                    
-                    // Skip empty rows
-                    if ($amount === null || $narration === '') {
-                        continue;
-                    }
-
-                    $unmatchedLedger[] = [
-                        'date' => $ledgerLine['date'] ?? null,
-                        'narration' => $narration,
-                        'amount' => $amount,
-                        'type' => ($ledgerLine['amount'] ?? 0) > 0 ? 'Cr' : 'Dr',
-                        'reason' => 'No matching entry found in Bank Statement.',
-                    ];
-                }
-
-            }
-
-            $finalUnmatchedBank = collect($unmatchedBankArray)
-                ->filter(fn($val, $key) => !in_array($key, $bankIndicesUsed, true))
-                ->values()
-                ->toArray();
-
-            return [$matched, $unmatchedLedger, $finalUnmatchedBank];
-        }
-
-        public function uploadBackup(): void
-        {
-            if (empty($this->backup_file) || !method_exists($this->backup_file, 'getRealPath')) {
-                Notification::make()
-                    ->title('❌ Upload Failed')
-                    ->body('No valid backup file selected.')
-                    ->danger()
-                    ->send();
-                return;
-            }
-
-            $filePath = $this->backup_file->getRealPath();
-            if (!$filePath || !file_exists($filePath)) {
-                Notification::make()
-                    ->title('⚠️ File not found.')
-                    ->danger()
-                    ->send();
-                return;
-            }
-
-            $rows = array_map('str_getcsv', file($filePath));
-            array_shift($rows); // remove header row
-
-            $imported = 0;
-            foreach ($rows as $row) {
-                if (count($row) < 4) continue;
-
-                [$date, $narration, $amount, $type, $uid] = array_pad($row, 5, null);
-
-                $this->results['matched'][] = [
-                    'tra_date' => $date,
-                    'tra_narration' => $narration,
-                    'tra_amount' => (float) $amount,
-                    'tra_type' => $type,
-                    'uid' => $uid ?? (string) \Illuminate\Support\Str::uuid(),
-                    'moved_from_unmatched' => true,
-                    'manual_verified' => true,
-                ];
-
-                $imported++;
-            }
-
-            if ($imported > 0) {
-                Notification::make()
-                    ->title('✅ Backup Imported')
-                    ->body("$imported records restored into the matched list.")
-                    ->success()
-                    ->send();
-            } else {
-                Notification::make()
-                    ->title('⚠️ Backup Empty')
-                    ->body('No valid records found in uploaded CSV.')
-                    ->warning()
-                    ->send();
-            }
-
-            $this->matchedCount = count($this->results['matched']);
-            $this->resetTable();
-        }
-        
-
-        public function exportCurrentViewToCsv(string $mode): \Symfony\Component\HttpFoundation\StreamedResponse
-        {
-            $dataToExport = $this->results[$mode] ?? [];
-
-            if (empty($dataToExport)) {
-                Notification::make()
-                    ->title("⚠️ No Data Found")
-                    ->body("No records available in the selected list ({$mode}).")
-                    ->warning()
-                    ->send();
-
-                return response()->stream(fn() => '', 200, [
-                    'Content-Type' => 'text/plain',
-                ]);
-            }
-
-            $fileName = "{$mode}_transactions_" . date('Ymd_His') . '.csv';
-            $headers = [
-                'Content-Type' => 'text/csv',
-                'Content-Disposition' => "attachment; filename=\"$fileName\"",
+            $possibleMatches[] = [
+                'index' => $bankIndex,
+                'record' => $bankRec,
+                'similarity' => $similarity,
             ];
-
-            $callback = function () use ($dataToExport, $mode) {
-                $file = fopen('php://output', 'w');
-
-                // Headers
-                if ($mode === 'matched') {
-                    fputcsv($file, [
-                        'Sl No', 'Date', 'Narration', 'Amount', 'Cr/Dr',
-                        'Match Date', 'Match Narration', 'Match Amount', 'Match Type',
-                        'Manual Verified', 'From Unmatched'
-                    ]);
-                } else {
-                    fputcsv($file, [
-                        'Sl No', 'Date', 'Narration', 'Amount', 'Cr/Dr', 'Reason'
-                    ]);
-                }
-
-                // Rows
-                $sl = 1;
-                foreach ($dataToExport as $row) {
-                    if ($mode === 'matched') {
-                        fputcsv($file, [
-                            $sl++,
-                            $row['tra_date'] ?? '',
-                            $row['tra_narration'] ?? '',
-                            $row['tra_amount'] ?? '',
-                            $row['tra_type'] ?? '',
-                            $row['match_date'] ?? '',
-                            $row['match_narration'] ?? '',
-                            $row['match_amount'] ?? '',
-                            $row['match_type'] ?? '',
-                            ($row['manual_verified'] ?? false) ? 'Yes' : 'No',
-                            ($row['from_unmatched'] ?? false) ? 'Yes' : 'No',
-                        ]);
-                    } else {
-                        fputcsv($file, [
-                            $sl++,
-                            $row['date'] ?? '',
-                            $row['narration'] ?? '',
-                            $row['amount'] ?? '',
-                            $row['type'] ?? '',
-                            // $row['reason'] ?? '',
-                        ]);
-                    }
-                }
-
-                fclose($file);
-            };
-
-            return response()->stream($callback, 200, $headers);
         }
+
+        if (count($possibleMatches) > 0) {
+            // sort best first
+            usort($possibleMatches, fn($a, $b) => $b['similarity'] <=> $a['similarity']);
+
+            $best = $possibleMatches[0];
+            $bankKey = $normalizeNarration($best['record']['narration']).'|'.$normalizeAmount($best['record']['amount']).'|'.$normalizeDate($best['record']['date']);
+
+            // ✅ Check if this bank transaction was already used before (duplicate)
+            $alreadyUsed = collect($matched)->first(fn($m) =>
+                $normalizeNarration($m['match_narration']) === $normalizeNarration($best['record']['narration'])
+                && $normalizeAmount($m['match_amount']) === $normalizeAmount($best['record']['amount'])
+                && $normalizeDate($m['match_date']) === $normalizeDate($best['record']['date'])
+            );
+
+            if ($alreadyUsed) {
+                // 🟡 Move to duplicates
+                $duplicates[] = [
+                    'tra_date' => $ledgerLine['date'] ?? null,
+                    'tra_narration' => $ledgerLine['narration'] ?? '',
+                    'tra_amount' => $ledgerLine['amount_abs'] ?? $ledgerLine['amount'] ?? 0,
+                    'tra_type' => ($ledgerLine['amount'] ?? 0) > 0 ? 'Cr' : 'Dr',
+                    'dup_date' => $best['record']['date'] ?? null,
+                    'dup_narration' => $best['record']['narration'] ?? '',
+                    'dup_amount' => $best['record']['amount_abs'] ?? $best['record']['amount'] ?? 0,
+                    'dup_type' => ($best['record']['amount'] ?? 0) > 0 ? 'Credit (Bank)' : 'Debit (Bank)',
+                    'similarity' => round($best['similarity'], 2),
+                    'reason' => 'Duplicate match: same narration, amount & date as existing match',
+                ];
+            } else {
+                $bankIndicesUsed[] = $best['index'];
+                $matched[] = [
+                    'tra_date' => $ledgerLine['date'] ?? null,
+                    'tra_narration' => $ledgerLine['narration'] ?? '',
+                    'tra_amount' => $ledgerLine['amount_abs'] ?? $ledgerLine['amount'] ?? 0,
+                    'tra_type' => ($ledgerLine['amount'] ?? 0) > 0 ? 'Cr' : 'Dr',
+                    'match_date' => $best['record']['date'] ?? null,
+                    'match_narration' => $best['record']['narration'] ?? '',
+                    'match_amount' => $best['record']['amount_abs'] ?? $best['record']['amount'] ?? 0,
+                    'match_type' => ($best['record']['amount'] ?? 0) > 0 ? 'Credit (Bank)' : 'Debit (Bank)',
+                    'similarity' => round($best['similarity'], 2),
+                    'match_method' => 'Amount + Narration',
+                ];
+            }
+        } else {
+            $unmatchedLedger[] = [
+                'date' => $ledgerLine['date'] ?? null,
+                'narration' => $ledgerLine['narration'] ?? '',
+                'amount' => $ledgerLine['amount_abs'] ?? $ledgerLine['amount'] ?? 0,
+                'type' => ($ledgerLine['amount'] ?? 0) > 0 ? 'Cr' : 'Dr',
+                'reason' => 'No matching entry found in Bank Statement.',
+            ];
+        }
+    }
+
+    $finalUnmatchedBank = collect($unmatchedBankArray)
+        ->filter(fn($val, $key) => !in_array($key, $bankIndicesUsed, true))
+        ->values()
+        ->toArray();
+
+    return [$matched, $unmatchedLedger, $finalUnmatchedBank, $duplicates];
+}
+
+
     public function downloadManualBackup(): ?StreamedResponse
     {
         $manualData = collect($this->results['matched'] ?? [])
@@ -523,6 +388,7 @@ class IBrsComparison extends Page implements HasForms, HasTable
             'matched' => $this->results['matched'] ?? [],
             'unmatched_ledger' => $this->results['unmatched_ledger'] ?? [],
             'unmatched_bank' => $this->results['unmatched_bank'] ?? [],
+            'duplicates' => $this->results['duplicates'] ?? [],
             default => [],
         };
 
@@ -535,7 +401,22 @@ class IBrsComparison extends Page implements HasForms, HasTable
             'matched' => [
                 $slNoColumn,
                 TextColumn::make('tra_date')->label('Date')->sortable(),
-                TextColumn::make('tra_narration')->label('Narration')->limit(40),
+                TextColumn::make('tra_narration')->label('Narration')
+                    // ->formatStateUsing(function ($state) {
+                    //     if (!$state) return '';
+                        
+                    //     // Replace separators with newlines for better readability
+                    //     $formatted = str_replace(['-', '/'], ["-\n", "/\n"], $state);
+                        
+                    //     // Keep safe HTML line breaks
+                    //     return nl2br(e($formatted));
+                    // })
+                    // ->html()
+                    // ->wrap()
+                    // ->extraAttributes([
+                    //     'style' => 'white-space: normal; line-height: 1.4; font-family: monospace; font-size: 13px;',
+                    // ]),
+                    ->wrap()->extraAttributes(['style' => 'white-space: normal; max-width: none;']),
                 TextColumn::make('tra_amount')
                     ->label('Amount')
                     ->getStateUsing(fn($record) => number_format($record['tra_amount'] ?? 0, 2))
@@ -554,7 +435,7 @@ class IBrsComparison extends Page implements HasForms, HasTable
             'unmatched_ledger' => [
                 $slNoColumn,
                 TextColumn::make('date')->label('Date')->sortable(),
-                TextColumn::make('narration')->label('Narration')->limit(40),
+                TextColumn::make('narration')->label('Narration')->wrap()->extraAttributes(['style' => 'white-space: normal; max-width: none;']),
                 TextColumn::make('amount')
                     ->label('Amount')
                     ->getStateUsing(fn($record) => number_format($record['amount'] ?? 0, 2))
@@ -568,6 +449,17 @@ class IBrsComparison extends Page implements HasForms, HasTable
                         'dr' => 'danger',
                         default => 'secondary',
                     })
+            ],
+
+            'duplicates' => [
+                $slNoColumn,
+                TextColumn::make('tra_date')->label('Date')->sortable(),
+                TextColumn::make('tra_narration')->label('Narration')->wrap(),
+                TextColumn::make('tra_amount')->label('Amount')->getStateUsing(fn($r) => number_format($r['tra_amount'] ?? 0, 2))->alignRight(),
+                TextColumn::make('dup_date')->label('Duplicate Date'),
+                TextColumn::make('dup_narration')->label('Duplicate Narration')->wrap(),
+                TextColumn::make('dup_amount')->label('Duplicate Amount')->getStateUsing(fn($r) => number_format($r['dup_amount'] ?? 0, 2))->alignRight(),
+                TextColumn::make('reason')->label('Reason')->wrap(),
             ],
 
             default => [],
@@ -613,6 +505,13 @@ class IBrsComparison extends Page implements HasForms, HasTable
 
 
         return $table
+            ->heading(match ($this->viewMode) {
+                'matched' => 'Matched Transactions',
+                'unmatched_ledger' => 'Unmatched Transactions',
+                'unmatched_bank' => 'Unmatched Bank Transactions',
+                default => 'Comparison Results',
+            })
+
             ->records(fn() => collect($data))
             ->columns($columns)
             ->actions($actions)
@@ -709,8 +608,8 @@ class IBrsComparison extends Page implements HasForms, HasTable
             ->defaultSort(match ($this->viewMode) {
                 'matched' => 'tra_date',
                 default => 'date',
-            }, 'desc')
-            ->heading(Str::headline($this->viewMode) . " Entries (" . count($data) . ")");
+            }, 'desc');
+           // ->heading(Str::headline($this->viewMode) . " Entries (" . count($data) . ")");
 
     }
 

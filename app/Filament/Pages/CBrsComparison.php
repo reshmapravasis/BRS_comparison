@@ -240,42 +240,61 @@ class CBrsComparison extends Page implements  HasTable
         // 8️⃣ Comparison logic (exact match)
         $matched = collect();
         $unmatched = collect();
+        $duplicates = collect();
+
         // 🆕 Add index tracking
         $ledgerDataWithIndex = $ledgerData->values()->map(function ($item, $index) {
             $item['original_index'] = $index; // Store the original index
             return $item;
         });
 
-        foreach ($ledgerDataWithIndex as $line) { // Use the indexed collection
-            $found = false;
-            // ... (rest of the exact match logic remains the same) ...
-            $amount = (float) str_replace([',', '+', '-'], '', $line['amount']);
-            $narration = preg_replace('/\s+/', '', strtolower(trim($line['narration'])));
+        foreach ($ledgerDataWithIndex as $line) {
+    $found = false;
 
-            foreach ($bankData as $record) {
-                $recordAmount = (float) str_replace([',', '+', '-'], '', $record['tra_amount']);
-                $recordNarr = preg_replace('/\s+/', '', strtolower(trim($record['tra_narration'])));
+    $amount = (float) str_replace([',', '+', '-'], '', $line['amount']);
+    $narration = preg_replace('/\s+/', '', strtolower(trim($line['narration'])));
+    $date = $line['date'] ?? null;
 
-                if ($recordNarr === $narration && abs($recordAmount - $amount) < 0.01) {
-                    $matched->push([
-                        'tra_id' => $record['tra_id'],
-                        'tra_date' => $line['date'],
-                        'tra_narration' => $line['narration'],
-                        'tra_amount' => $line['amount'],
-                        'bank_date' => $record['tra_date'],
-                        'bank_amount' => $record['tra_amount'],
-                        'tra_voucher_number' => $record['tra_voucher_number'],
-                        'original_index' => $line['original_index'], // 🆕 Keep the index
-                    ]);
-                    $found = true;
-                    break;
-                }
+    foreach ($bankData as $record) {
+        $recordAmount = (float) str_replace([',', '+', '-'], '', $record['tra_amount']);
+        $recordNarr = preg_replace('/\s+/', '', strtolower(trim($record['tra_narration'])));
+        $recordDate = $record['tra_date'] ?? null;
+
+        // ✅ comparison logic unchanged
+        if ($recordNarr === $narration && abs($recordAmount - $amount) < 0.01) {
+            // 🆕 check if already matched before (same narration+amount+date)
+            $isDuplicate = $matched->contains(function ($m) use ($recordNarr, $recordAmount, $recordDate) {
+                return preg_replace('/\s+/', '', strtolower(trim($m['tra_narration']))) === $recordNarr
+                    && abs((float)$m['tra_amount'] - $recordAmount) < 0.01
+                    && ($m['tra_date'] ?? null) === $recordDate;
+            });
+
+            $entry = [
+                'tra_id' => $record['tra_id'],
+                'tra_date' => $line['date'],
+                'tra_narration' => $line['narration'],
+                'tra_amount' => $line['amount'],
+                'bank_date' => $record['tra_date'],
+                'bank_amount' => $record['tra_amount'],
+                'tra_voucher_number' => $record['tra_voucher_number'],
+                'original_index' => $line['original_index'],
+            ];
+
+            if ($isDuplicate) {
+                $duplicates->push($entry); // 🟡 goes to duplicates
+            } else {
+                $matched->push($entry); // ✅ first occurrence goes to matched
             }
 
-            if (!$found) {
-                $unmatched->push($line);
-            }
+            $found = true;
+            break;
         }
+    }
+
+    if (!$found) {
+        $unmatched->push($line);
+    }
+}
         $getType = function ($amount) {
             return ((float) $amount) > 0 ? 'Cr' : 'Dr';
         };
@@ -313,6 +332,22 @@ class CBrsComparison extends Page implements  HasTable
                 'from_unmatched' => false,
             ];
         })->toArray();
+
+        $this->results['duplicates'] = $duplicates->values()->map(function ($row, $index) use ($getType) {
+    $amount = $row['tra_amount'] ?? 0;
+    $type = $getType($amount);
+    return [
+        'original_index' => $row['original_index'] ?? $index,
+        'tra_id' => $row['tra_id'],
+        'tra_voucher_number' => $row['tra_voucher_number'],
+        'narration' => $row['tra_narration'] ?? '',
+        'date' => $row['tra_date'] ?? '',
+        'amount' => $amount,
+        'type' => $type,
+        'color' => $type === 'Cr' ? 'text-green-600' : 'text-red-600',
+    ];
+})->toArray();
+
 
             // 🆕 Populate unmatched map (key is the original index)
             // $this->unmatchedMap[$row['original_index']] = $item;
@@ -681,6 +716,13 @@ class CBrsComparison extends Page implements  HasTable
     public function table(Table $table): Table
     {
         return $table
+            ->heading(match ($this->viewMode) {
+                'unmatched' => 'Matched Transactions',
+                'matched' => 'Unmatched Transactions',
+                'duplicates' => 'Duplicates Transactions',
+                //'unmatched_bank' => 'Unmatched Bank Transactions',
+                default => 'Comparison Results',
+            })
             ->columns([
                 TextColumn::make('sl_no')
                     ->label('Sl No')
@@ -721,9 +763,12 @@ class CBrsComparison extends Page implements  HasTable
 
             // ✅ This provides data from arrays instead of Eloquent
         ->records(function () {
-            $sourceData = $this->viewMode === 'matched' 
-                ? ($this->results['matched'] ?? []) 
-                : ($this->results['unmatched'] ?? []);
+             $sourceData = match ($this->viewMode) {
+                'matched' => $this->results['matched'] ?? [],
+                'unmatched' => $this->results['unmatched'] ?? [],
+                'duplicates' => $this->results['duplicates'] ?? [], // 🆕 Added
+                default => [],
+            };
 
             return collect($sourceData)
                 ->values()
@@ -801,36 +846,36 @@ class CBrsComparison extends Page implements  HasTable
 
         // 🆕 Add table actions
             ->actions([
-          Action::make('verify_or_revert')
-        ->label(fn ($record) => match($this->viewMode) {
-            'matched' => ($record['from_unmatched'] ?? false) ? 'Revert' : 'Verified',
-            'unmatched' => 'Verify',
-            default => 'Action',
-        })
-        ->color(fn ($record) => match($this->viewMode) {
-            'matched' => ($record['from_unmatched'] ?? false) ? 'danger' : 'info',
-            'unmatched' => 'primary',
-            default => 'secondary',
-        })
-        ->button()
-        ->disabled(fn ($record) => 
-            ($this->viewMode === 'matched' && !($record['from_unmatched'] ?? false))
-        )
-        ->action(function ($record) {
-            $originalIndex = $record['original_index'] ?? null;
-            if (!$originalIndex) return;
+                Action::make('verify_or_revert')
+                ->label(fn ($record) => match($this->viewMode) {
+                    'matched' => ($record['from_unmatched'] ?? false) ? 'Revert' : 'Verified',
+                    'unmatched' => 'Verify',
+                    default => 'Action',
+                })
+                ->color(fn ($record) => match($this->viewMode) {
+                    'matched' => ($record['from_unmatched'] ?? false) ? 'danger' : 'info',
+                    'unmatched' => 'primary',
+                    default => 'secondary',
+                })
+                ->button()
+                ->disabled(fn ($record) => 
+                    ($this->viewMode === 'matched' && !($record['from_unmatched'] ?? false))
+                )
+                ->action(function ($record) {
+                    $originalIndex = $record['original_index'] ?? null;
+                    if (!$originalIndex) return;
 
-            if ($this->viewMode === 'unmatched') {
-                // Move from unmatched to matched
-                $this->verifyTransaction($originalIndex);
-            } elseif ($this->viewMode === 'matched' && ($record['from_unmatched'] ?? false)) {
-                // Move back from matched to unmatched
-                $this->revertTransaction($originalIndex);
-            }
+                    if ($this->viewMode === 'unmatched') {
+                        // Move from unmatched to matched
+                        $this->verifyTransaction($originalIndex);
+                    } elseif ($this->viewMode === 'matched' && ($record['from_unmatched'] ?? false)) {
+                        // Move back from matched to unmatched
+                        $this->revertTransaction($originalIndex);
+                    }
 
-            session()->put('brs_results', $this->results);
-            $this->resetTable();
-        }),
+                    session()->put('brs_results', $this->results);
+                    $this->resetTable();
+                }),
             ]);
     }
 
