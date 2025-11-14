@@ -44,14 +44,7 @@
                     Unmatched Ledger ({{ count($this->results['unmatched_ledger']) }})
                 </x-filament::button>
 
-                <x-filament::button
-                    color="{{ $this->viewMode === 'duplicates' ? 'warning' : 'gray' }}"
-                    wire:click="toggleView('duplicates')"
-                    :disabled="empty($this->results['duplicates'])"
-                >
-                    Duplicates ({{ count($this->results['duplicates'] ?? []) }})
-                </x-filament::button>
-
+                
                 
             </div>
 

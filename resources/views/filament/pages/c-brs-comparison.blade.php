@@ -19,9 +19,10 @@
                     <strong><span style="color: blue;">Total Entry within Date Range:</strong> <span style="color: gray;">{{ $this->apiCount }} </span></strong>
                 </div>
                 <div class="text-sm text-gray-700 dark:text-gray-300">
-                    <strong><span style="color: blue;">Total Compared:</strong><span style="color: gray;"> {{ $this->matchedCount + $this->unmatchedCount }} </strong></span> |
+                    <strong><span style="color: blue;">Total Compared:</strong><span style="color: gray;"> {{ $this->matchedCount + $this->unmatchedCount + $this->duplicateCount }} </strong></span> |
                     <span style="color: green;">Matched: {{ $this->matchedCount }}</span> |
-                    <span style="color: red;">Unmatched: {{ $this->unmatchedCount }}</span>
+                    <span style="color: red;">Unmatched: {{ $this->unmatchedCount }}</span> |
+                    <span style="color: red;">Duplicte: {{ $this->duplicateCount }}</span>
                 </div>
             </div>
 
