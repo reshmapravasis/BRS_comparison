@@ -227,155 +227,193 @@ class CBrsComparison extends Page implements  HasTable
             throw new \Exception('No transactions found in uploaded file.');
         }
 
-        // 8️⃣ New Comparison Logic (Match, Duplicate, Unmatched)
-        $matched = collect();
-        $duplicates = collect();
-        $unmatchedLedger = collect();
-        $usedBankIndexes = [];
+        // 8️⃣ API → Ledger Comparison Logic (REPLACE OLD BLOCK WITH THIS)
+    $matched = collect();
+    $duplicates = collect();
+    $unmatchedBank = collect();
+    $usedLedgerIndexes = [];
 
-        // Add index tracking
-        $ledgerRows = $ledgerData->values()->map(function ($row, $index) {
-            $row['original_index'] = $index;
-            return $row;
-        });
+    // Build ledgerRows with original_index so we can reference them later
+    $ledgerRows = $ledgerData->values()->map(function ($row, $index) {
+        $row['original_index'] = $index;
+        return $row;
+    })->toArray(); // make it array so indexing is stable
 
-        foreach ($ledgerRows as $line) {
+    // inline normalizers
+    $normalizeNarr = function ($text) {
+        return preg_replace('/\s+/', '', strtolower(trim((string) $text)));
+    };
+    $normalizeAmt = function ($amt) {
+        return number_format(abs((float) str_replace([',', '+', '-'], '', trim((string)$amt))), 2, '.', '');
+    };
 
-            $ledgerAmount = (float) str_replace([',', '+', '-'], '', $line['amount']);
-            $ledgerNarr  = preg_replace('/\s+/', '', strtolower($line['narration']));
+    // persistent seen keys across loop
+    $seenCompositeKeys = [];
 
-            $matches = [];
+    foreach ($bankData->values() as $bankIndex => $record) {
 
-            foreach ($bankData as $bankIndex => $record) {
+        $rawNarr = trim($record['tra_narration'] ?? '');
+        $afterTilde = strpos($rawNarr, '~') !== false ? substr($rawNarr, strpos($rawNarr, '~') + 1) : $rawNarr;
 
-                if (in_array($bankIndex, $usedBankIndexes)) {
-                    continue; // already consumed
-                }
+        $bankNarr = $normalizeNarr($afterTilde);
+        $bankAmt = $normalizeAmt($record['tra_amount'] ?? 0);
 
-                $bankAmount = (float) str_replace([',', '+', '-'], '', $record['tra_amount']);
-                $bankNarr   = preg_replace('/\s+/', '', strtolower($record['tra_narration']));
+        $compositeKey = $bankNarr . '|' . $bankAmt;
 
-                if ($bankNarr === $ledgerNarr && abs($bankAmount - $ledgerAmount) < 0.01) {
-                    $matches[] = ['index' => $bankIndex, 'record' => $record];
-                }
+        // detect API duplicate
+        if (isset($seenCompositeKeys[$compositeKey])) {
+            // give duplicate a fallback original_index using bankIndex so UI remains stable
+            $duplicates->push(array_merge((array)$record, [
+                'original_index' => 'api_dup_' . $bankIndex,
+            ]));
+            continue;
+        }
+        $seenCompositeKeys[$compositeKey] = true;
+
+        // find all ledger matches (allow duplicates)
+        $ledgerMatches = [];
+        foreach ($ledgerRows as $ledgerIndex => $line) {
+            $ledgerNarr = $normalizeNarr($line['narration'] ?? '');
+            $ledgerAmt = $normalizeAmt($line['amount'] ?? 0);
+
+            if ($bankNarr === $ledgerNarr && $ledgerAmt === $bankAmt) {
+                $ledgerMatches[] = ['index' => $ledgerIndex, 'line' => $line];
             }
+        }
 
-            if (empty($matches)) {
-                $unmatchedLedger->push($line);
-                continue;
-            }
+        if (empty($ledgerMatches)) {
+            // unmatched API (bank) record — give stable original_index for UI
+            $unmatchedBank->push(array_merge((array)$record, [
+                'original_index' => 'api_unm_' . $bankIndex,
+                // keep other expected keys to match UI columns
+                'tra_date' => $record['tra_date'] ?? null,
+                'tra_narration' => $record['tra_narration'] ?? null,
+                'tra_amount' => $record['tra_amount'] ?? null,
+            ]));
+            continue;
+        }
 
-            // First match → matched
-            $first = array_shift($matches);
+        // First match -> matched
+        $first = array_shift($ledgerMatches);
+        $firstIndex = $first['index'];
+        $firstLine = $first['line'];
 
-            $matched->push([
-                'tra_id' => $first['record']['tra_id'],
-                'tra_date' => $line['date'],
-                'tra_narration' => $line['narration'],
-                'tra_amount' => $line['amount'],
-                'bank_date' => $first['record']['tra_date'],
-                'bank_amount' => $first['record']['tra_amount'],
-                'tra_voucher_number' => $first['record']['tra_voucher_number'],
-                'original_index' => $line['original_index'],
+        $matched->push([
+            'original_index' => $firstLine['original_index'] ?? ('l_' . $firstIndex),
+            'tra_id' => $record['tra_id'] ?? null,
+            'tra_voucher_number' => $record['tra_voucher_number'] ?? null,
+            'narration' => $firstLine['narration'] ?? $record['tra_narration'] ?? null,
+            'date' => $firstLine['date'] ?? $record['tra_date'] ?? null,
+            'amount' => ltrim((string)($firstLine['amount'] ?? $record['tra_amount'] ?? ''), '+-'),
+            'type' => (substr(trim((string)($firstLine['amount'] ?? $record['tra_amount'] ?? '')), 0, 1) === '+' ? 'Cr' : 'Dr'),
+            'manual_verified' => false,
+        ]);
+
+        // mark only the first matched ledger index as "used" (so it's not shown later as unmatched ledger)
+        $usedLedgerIndexes[] = $firstIndex;
+
+        // Remaining ledgerMatches (if any) -> duplicates (use ledger original_index for UI)
+        foreach ($ledgerMatches as $dup) {
+            $dupIndex = $dup['index'];
+            $dupLine = $dup['line'];
+
+            $duplicates->push([
+                'original_index' => $dupLine['original_index'] ?? ('l_dup_' . $dupIndex),
+                'tra_id' => $record['tra_id'] ?? null,
+                'tra_voucher_number' => $record['tra_voucher_number'] ?? null,
+                'narration' => $dupLine['narration'] ?? $record['tra_narration'] ?? null,
+                'date' => $dupLine['date'] ?? $record['tra_date'] ?? null,
+                'amount' => ltrim((string)($dupLine['amount'] ?? $record['tra_amount'] ?? ''), '+-'),
+                'type' => (substr(trim((string)($dupLine['amount'] ?? $record['tra_amount'] ?? '')), 0, 1) === '+' ? 'Cr' : 'Dr'),
             ]);
 
-            $usedBankIndexes[] = $first['index'];
-
-            // Remaining → duplicates
-            foreach ($matches as $dup) {
-
-                $duplicates->push([
-                    'tra_id' => $dup['record']['tra_id'],
-                    'tra_date' => $line['date'],
-                    'tra_narration' => $line['narration'],
-                    'tra_amount' => $line['amount'],
-                    'bank_date' => $dup['record']['tra_date'],
-                    'bank_amount' => $dup['record']['tra_amount'],
-                    'tra_voucher_number' => $dup['record']['tra_voucher_number'],
-                    'original_index' => $line['original_index'],
-                ]);
-
-                $usedBankIndexes[] = $dup['index'];
-            }
+            // do NOT mark duplicates as used — they remain ledger entries that matched multiple times
         }
+    }
 
-        // 9️⃣ Unmatched Bank Records
-        $unmatchedBank = collect();
-        foreach ($bankData as $bankIndex => $record) {
-            if (!in_array($bankIndex, $usedBankIndexes)) {
-                $unmatchedBank->push($record);
-            }
+    // 9️⃣ Build Unmatched Ledger collection: ledger rows not used by first-match
+    $unmatchedLedger = collect();
+    foreach ($ledgerRows as $idx => $row) {
+        if (!in_array($idx, $usedLedgerIndexes, true)) {
+            // ensure original_index exists
+            $row['original_index'] = $row['original_index'] ?? $idx;
+            $unmatchedLedger->push($row);
         }
+    }
 
-        //  🔟 Build Output Format
-        $getType = fn($amount) => ((float) $amount) > 0 ? 'Cr' : 'Dr';
+    // --- Now map these collections into the UI arrays exactly like your original code expected ---
 
-        // Matched UI format
-        $this->results['matched'] = $matched->map(function ($row) use ($getType) {
-            $type = $getType($row['tra_amount']);
-            return [
-                'original_index' => $row['original_index'],
-                'tra_id' => $row['tra_id'],
-                'tra_voucher_number' => $row['tra_voucher_number'],
-                'narration' => $row['tra_narration'],
-                'date' => $row['tra_date'],
-                'amount' => $row['tra_amount'],
-                'type' => $type,
-                'color' => $type === 'Cr' ? 'text-green-600' : 'text-red-600',
-                'manual_verified' => false,
-            ];
-        })->values()->toArray();
+    $getType = fn($amount) => ((float) $amount) > 0 ? 'Cr' : 'Dr';
 
-        // Duplicate UI
-        $this->results['duplicates'] = $duplicates->map(function ($row) use ($getType) {
-            $type = $getType($row['tra_amount']);
-            return [
-                'original_index' => $row['original_index'],
-                'tra_id' => $row['tra_id'],
-                'tra_voucher_number' => $row['tra_voucher_number'],
-                'narration' => $row['tra_narration'],
-                'date' => $row['tra_date'],
-                'amount' => $row['tra_amount'],
-                'type' => $type,
-                'color' => $type === 'Cr' ? 'text-green-600' : 'text-red-600',
-            ];
-        })->values()->toArray();
+    // Matched UI format (already contains required keys)
+    $this->results['matched'] = $matched->map(function ($row) use ($getType) {
+        $type = $getType($row['amount'] ?? 0);
+        return [
+            'original_index' => $row['original_index'] ?? null,
+            'tra_id' => $row['tra_id'] ?? null,
+            'tra_voucher_number' => $row['tra_voucher_number'] ?? '-',
+            'narration' => $row['narration'] ?? '',
+            'date' => $row['date'] ?? '',
+            'amount' => $row['amount'] ?? '',
+            'type' => $type,
+            'color' => $type === 'Cr' ? 'text-green-600' : 'text-red-600',
+            'manual_verified' => $row['manual_verified'] ?? false,
+        ];
+    })->values()->toArray();
 
-        // Unmatched Ledger UI
-        $unmatchedLedgerUI = $unmatchedLedger->map(function ($row) use ($getType) {
-            return [
-                'original_index' => $row['original_index'],
-                'tra_id' => '-',
-                'tra_voucher_number' => '-',
-                'narration' => $row['narration'],
-                'date' => $row['date'],
-                'amount' => $row['amount'],
-                'type' => $getType($row['amount']),
-                'manual_verified' => false,
-            ];
-        });
+    // Duplicate UI
+    $this->results['duplicates'] = $duplicates->map(function ($row) use ($getType) {
+        $type = $getType($row['amount'] ?? 0);
+        return [
+            'original_index' => $row['original_index'] ?? null,
+            'tra_id' => $row['tra_id'] ?? null,
+            'tra_voucher_number' => $row['tra_voucher_number'] ?? '-',
+            'narration' => $row['tra_narration'] ?? '',
+            'date' => $row['tra_date'] ?? '',
+            'amount' => $row['tra_amount'] ?? '',
+            'type' => $type,
+            'color' => $type === 'Cr' ? 'text-green-600' : 'text-red-600',
+        ];
+    })->values()->toArray();
 
-        $this->results['unmatched'] = $unmatchedLedgerUI->values()->toArray();
+    // Unmatched Ledger UI
+    $unmatchedLedgerUI = $unmatchedLedger->map(function ($row) use ($getType) {
+        return [
+            'original_index' => $row['original_index'] ?? null,
+            'tra_id' => '-',
+            'tra_voucher_number' => '-',
+            'narration' => $row['narration'] ?? '',
+            'date' => $row['date'] ?? '',
+            'amount' => ltrim((string)($row['amount'] ?? ''), '+-'),
+            'type' => $getType($row['amount'] ?? 0),
+            'manual_verified' => false,
+        ];
+    });
 
-        // Unmatched Bank list (optional UI)
-        $this->results['unmatched_bank'] = $unmatchedBank->values()->toArray();
+    $this->results['unmatched'] = $unmatchedLedgerUI->values()->toArray();
 
-        // Counts
-        $this->ledgerCount = $ledgerData->count();
-        $this->apiCount = $bankData->count();
-        $this->matchedCount = $matched->count();
-        $this->unmatchedCount = $unmatchedLedger->count();
-        $this->duplicateCount = $duplicates->count();
-        $this->unmatchedBankCount = $unmatchedBank->count();
+    // Unmatched Bank list (optional UI) — ensure original_index exists
+    $this->results['unmatched_bank'] = $unmatchedBank->map(function ($row, $i) {
+        return array_merge(['original_index' => $row['original_index'] ?? 'api_unm_'.$i], (array)$row);
+    })->values()->toArray();
 
-        // Refresh UI
-        $this->dispatch('$refresh');
+    // Counts
+    $this->ledgerCount = $ledgerData->count();
+    $this->apiCount = $bankData->count();
+    $this->matchedCount = $matched->count();
+    $this->unmatchedCount = $unmatchedLedger->count();
+    $this->duplicateCount = $duplicates->count();
+    $this->unmatchedBankCount = $unmatchedBank->count();
 
-        Notification::make()
-            ->title('✅ Comparison Completed')
-            ->body("Matched: {$this->matchedCount} | Duplicates: {$this->duplicateCount} | Unmatched Ledger: {$this->unmatchedCount} | Unmatched Bank: {$this->unmatchedBankCount}")
-            ->success()
-            ->send();
+    // Refresh UI & notify (keeps your original behavior)
+    $this->dispatch('$refresh');
+
+    Notification::make()
+        ->title('✅ Comparison Completed')
+        ->body("Matched: {$this->matchedCount} | Duplicates: {$this->duplicateCount} | Unmatched Ledger: {$this->unmatchedCount} | Unmatched Bank: {$this->unmatchedBankCount}")
+        ->success()
+        ->send();
+
 
     } catch (\Throwable $e) {
         Log::error('Comparison Failed', ['error' => $e->getMessage()]);
@@ -387,133 +425,132 @@ class CBrsComparison extends Page implements  HasTable
             ->send();
     }
 }
-
-     
+    
     public function verifyTransaction(int $originalIndex): void
-{
-    if (!isset($this->unmatchedMap[$originalIndex])) return;
+    {
+        if (!isset($this->unmatchedMap[$originalIndex])) return;
 
-    $item = $this->unmatchedMap[$originalIndex];
+        $item = $this->unmatchedMap[$originalIndex];
 
-    // Remove from unmatchedMap
-    $this->unmatchedMap = collect($this->unmatchedMap)
-        ->forget($originalIndex)
-        ->toArray();
+        // Remove from unmatchedMap
+        $this->unmatchedMap = collect($this->unmatchedMap)
+            ->forget($originalIndex)
+            ->toArray();
 
-    // Move to matched
-    $item['from_unmatched'] = true;
-    $item['manual_verified'] = true;
+        // Move to matched
+        $item['from_unmatched'] = true;
+        $item['manual_verified'] = true;
 
-    $this->results['matched'][] = $item;
+        $this->results['matched'][] = $item;
 
-    // Keep results['unmatched'] in sync
-    $this->results['unmatched'] = array_values($this->unmatchedMap);
+        // Keep results['unmatched'] in sync
+        $this->results['unmatched'] = array_values($this->unmatchedMap);
 
-    $this->refreshTables(); // Force Livewire to refresh
+        $this->refreshTables(); // Force Livewire to refresh
 
-    Notification::make()
-        ->title('✅ Verified')
-        ->body('Transaction moved to matched list.')
-        ->success()
-        ->send();
-}
-
-    public function revertTransaction(int $originalIndex): void
-{
-    $recordKey = null;
-
-    // Find the record in matched
-    foreach ($this->results['matched'] as $key => $row) {
-        if (($row['original_index'] ?? null) === $originalIndex) {
-            $recordKey = $key;
-            break;
-        }
+        Notification::make()
+            ->title('✅ Verified')
+            ->body('Transaction moved to matched list.')
+            ->success()
+            ->send();
     }
 
-    if ($recordKey === null) return;
+    public function revertTransaction(int $originalIndex): void
+    {
+        $recordKey = null;
 
-    $item = $this->results['matched'][$recordKey];
+        // Find the record in matched
+        foreach ($this->results['matched'] as $key => $row) {
+            if (($row['original_index'] ?? null) === $originalIndex) {
+                $recordKey = $key;
+                break;
+            }
+        }
 
-    // Remove from matched
-    unset($this->results['matched'][$recordKey]);
-    $this->results['matched'] = array_values($this->results['matched']);
+        if ($recordKey === null) return;
 
-    // Add back to unmatchedMap
-    $item['from_unmatched'] = false;
-    $item['manual_verified'] = false;
-    $this->unmatchedMap[$originalIndex] = $item;
+        $item = $this->results['matched'][$recordKey];
 
-    // Sync with results['unmatched']
-    $this->results['unmatched'] = array_values($this->unmatchedMap);
+        // Remove from matched
+        unset($this->results['matched'][$recordKey]);
+        $this->results['matched'] = array_values($this->results['matched']);
 
-    $this->refreshTables();
+        // Add back to unmatchedMap
+        $item['from_unmatched'] = false;
+        $item['manual_verified'] = false;
+        $this->unmatchedMap[$originalIndex] = $item;
 
-    Notification::make()
-        ->title('↩️ Reverted')
-        ->body('Transaction moved back to unmatched list.')
-        ->success()
-        ->send();
-}
+        // Sync with results['unmatched']
+        $this->results['unmatched'] = array_values($this->unmatchedMap);
+
+        $this->refreshTables();
+
+        Notification::make()
+            ->title('↩️ Reverted')
+            ->body('Transaction moved back to unmatched list.')
+            ->success()
+            ->send();
+    }
 
 
     public function downloadManualBackup(): ?StreamedResponse
     {
-    try {
-            $manualMatches = collect($this->results['matched'] ?? [])
-                ->filter(fn($row) => ($row['manual_verified'] ?? false) === true)
-                ->values();
+        try {
+                $manualMatches = collect($this->results['matched'] ?? [])
+                    ->filter(fn($row) => ($row['manual_verified'] ?? false) === true)
+                    ->values();
 
-            if ($manualMatches->isEmpty()) {
-                Notification::make()
-                    ->title('⚠️ No Manual Matches Found')
-                    ->body('There are no manually verified transactions to back up.')
-                    ->warning()
-                    ->send();
+                if ($manualMatches->isEmpty()) {
+                    Notification::make()
+                        ->title('⚠️ No Manual Matches Found')
+                        ->body('There are no manually verified transactions to back up.')
+                        ->warning()
+                        ->send();
 
-                return null; // ✅ allowed because of "?StreamedResponse"
-            }
-
-            $fileName = 'manual_matched_backup_' . date('Ymd_His') . '.csv';
-            $headers = [
-                'Content-Type' => 'text/csv',
-                'Content-Disposition' => 'attachment; filename="' . $fileName . '";',
-            ];
-
-            $callback = function () use ($manualMatches) {
-                $file = fopen('php://output', 'w');
-                fputcsv($file, [
-                    'original_index', 'tra_id', 'tra_voucher_number', 'narration',
-                    'date', 'amount', 'type', 'manual_verified', 'from_unmatched',
-                ]);
-
-                foreach ($manualMatches as $row) {
-                    fputcsv($file, [
-                        $row['original_index'] ?? '-',
-                        $row['tra_id'] ?? '-',
-                        $row['tra_voucher_number'] ?? '-',
-                        $row['narration'] ?? '',
-                        $row['date'] ?? '',
-                        $row['amount'] ?? '',
-                        $row['type'] ?? '',
-                        (int)($row['manual_verified'] ?? 1),
-                        (int)($row['from_unmatched'] ?? 1),
-                    ]);
+                    return null; // ✅ allowed because of "?StreamedResponse"
                 }
 
-                fclose($file);
-            };
+                $fileName = 'manual_matched_backup_' . date('Ymd_His') . '.csv';
+                $headers = [
+                    'Content-Type' => 'text/csv',
+                    'Content-Disposition' => 'attachment; filename="' . $fileName . '";',
+                ];
 
-            return response()->stream($callback, 200, $headers);
+                $callback = function () use ($manualMatches) {
+                    $file = fopen('php://output', 'w');
+                    fputcsv($file, [
+                        'original_index', 'tra_id', 'tra_voucher_number', 'narration',
+                        'date', 'amount', 'type', 'manual_verified', 'from_unmatched',
+                    ]);
 
-        } catch (\Throwable $e) {
-            Notification::make()
-                ->title('❌ Download Failed')
-                ->body('Something went wrong while generating the backup file.')
-                ->danger()
-                ->send();
+                    foreach ($manualMatches as $row) {
+                        fputcsv($file, [
+                            $row['original_index'] ?? '-',
+                            $row['tra_id'] ?? '-',
+                            $row['tra_voucher_number'] ?? '-',
+                            $row['narration'] ?? '',
+                            $row['date'] ?? '',
+                            $row['amount'] ?? '',
+                            $row['type'] ?? '',
+                            (int)($row['manual_verified'] ?? 1),
+                            (int)($row['from_unmatched'] ?? 1),
+                        ]);
+                    }
 
-            return null; // ✅ also allowed
-        }
+                    fclose($file);
+                };
+
+                return response()->stream($callback, 200, $headers);
+
+            } catch (\Throwable $e) {
+                Notification::make()
+                    ->title('❌ Download Failed')
+                    ->body('Something went wrong while generating the backup file.')
+                    ->danger()
+                    ->send();
+
+                return null; // ✅ also allowed
+            }
     }
 /**
  * Uploads a backup CSV and appends the transactions to the matched list.
@@ -717,12 +754,16 @@ class CBrsComparison extends Page implements  HasTable
     public function table(Table $table): Table
     {
         return $table
-            ->heading(match ($this->viewMode) {
-                'unmatched' => 'Matched Transactions',
-                'matched' => 'Unmatched Transactions',
-                'duplicates' => 'Duplicated Transactions',
-                //'unmatched_bank' => 'Unmatched Bank Transactions',
-                default => 'Comparison Results',
+            ->heading(function () {
+                $titles = [
+                    'matched' => 'Matched Transactions',
+                    'unmatched' => 'Unmatched Transactions',
+                    'duplicates' => 'Duplicated Transactions',
+                ];
+
+                $title = $titles[$this->viewMode] ?? 'Comparison Results';
+
+                return $title;
             })
             ->columns([
                 TextColumn::make('sl_no')
@@ -944,5 +985,10 @@ class CBrsComparison extends Page implements  HasTable
             'narration' => $l,
             'amount' => 0,
         ]);
+    }
+    
+     public function getFooter(): ?View
+    {
+        return view('filament.components.scroll-to-top');
     }
 }
